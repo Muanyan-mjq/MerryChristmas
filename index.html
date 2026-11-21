@@ -18,6 +18,13 @@
     -webkit-tap-highlight-color:transparent;
   }
   canvas#stage{ display:block; width:100%; height:100%; touch-action:none; }
+  /* 调试视口：把 375x667 之类的逻辑视口装进真实窗口，便于截图验证 */
+  body.dbg-box{ position:relative; overflow:hidden; }
+  body.dbg-box #stage{ position:absolute; inset:0; }
+  body.dbg-box #dock{ position:absolute; inset:0; }
+  body.dbg-box #controls, body.dbg-box #themes, body.dbg-box #toast, body.dbg-box #hint{
+    position:absolute;
+  }
   .ui{
     position:fixed; z-index:3; user-select:none; -webkit-user-select:none;
     font-family: ui-sans-serif, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
@@ -191,22 +198,16 @@ const CONFIG = {
     moundHeight: 0.55,
     groundGlowAlpha: 0.05
   },
-
-  ribbon: {
-    turns: 4.5, stripes: 4, spacing: 2.6, threadCount: 22, start: 7.0, grow: 2.8,
-    ribbonWidthBottom: 36, ribbonWidthTop: 19,
-    ribbonMinWidthPx: 8, ribbonMaxWidthPx: 44,
-    ribbonFitRadius: [0.985, 0.985, 0.985, 0.955, 0.985],
-    ribbonSink: 2,
-    ribbonRibStep: 1.6, ribbonRibFallbackStep: 2.2,
-    ribbonStitchLen: 2.4, ribbonStitchGap: 1.8,
-    scarfSliceCount: 60,
-    ribbonMinWidthRatio: 0.82, ribbonTwistMinRatio: 0.6, ribbonTwistMaxDeg: 6,
-    ribbonSliceOverlap: 2, ribbonMaxSampleGap: 3,
-    debugScarf: false,
-    ribbonTailLength: 64, ribbonFringeLength: 13
-  },
-  ornaments: { inside: 44, outside: 8, starRatio: 0.32 },
+  scarf: {
+    scarfTurns: 4, scarfWidthBottom: 36, scarfWidthTop: 19,
+    scarfFit: [0.985, 0.985, 0.93, 0.985],   // 由上到下
+    scarfSagPx: [1.5, 3], scarfSectionDeg: 1.5,
+    scarfStitchRowPx: 5, scarfStitchCols: 6,
+    scarfStripeGroups: 2, scarfFuzz: true, scarfStyle: 'knit',
+    scarfGrowSeconds: 2.6, scarfNeedlesMax: 100,
+    scarfTailLength: [56, 72], scarfFringeCount: [10, 12],
+    debugScarf: false
+  },  ornaments: { inside: 44, outside: 8, starRatio: 0.32 },
   snow: { count: 220, backRatio: 0.32 },
 
   text: {
@@ -453,10 +454,6 @@ let sceneCanvas = document.createElement('canvas');
 let sceneCtx = sceneCanvas.getContext('2d');
 const scene = { canvas: sceneCanvas, ctx: sceneCtx };
 
-// 围巾单独一张图层：所有部件同一进度、同一透明度
-let scarfCanvas = document.createElement('canvas');
-let scarfCtx = scarfCanvas.getContext('2d');
-
 const perf = { mode: 'off', factor: 1, level: 1, frames: 0, avgMs: 0, hidden: false };
 
 let G = {};
@@ -482,6 +479,8 @@ function layout() {
   const vp = window.visualViewport;
   VW = Math.round((vp && vp.width) || stage.clientWidth || window.innerWidth) || 390;
   VH = Math.round((vp && vp.height) || stage.clientHeight || window.innerHeight) || 844;
+  if (typeof DBG !== 'undefined' && DBG.w) VW = Math.round(DBG.w);
+  if (typeof DBG !== 'undefined' && DBG.h) VH = Math.round(DBG.h);
 
   // 逻辑舞台固定，全部内容都按这套坐标绘制
   W = CONFIG.stage.width;
@@ -510,7 +509,7 @@ function layout() {
   if (W * scale * dprCap > CONFIG.maxCanvasWidth) {
     dprCap = Math.max(1, CONFIG.maxCanvasWidth / (W * scale));
   }
-  dpr = Math.min(window.devicePixelRatio || 1, dprCap);
+  dpr = (typeof DBG !== 'undefined' && DBG.dpr) ? DBG.dpr : Math.min(window.devicePixelRatio || 1, dprCap);
 
   stage.width = Math.round(VW * dpr);
   stage.height = Math.round(VH * dpr);
@@ -518,16 +517,15 @@ function layout() {
 
   ox = (availW - W * scale) * 0.5;
   oy = (availH - H * scale) * 0.5;
+  window.__mc = { VW, VH, availW, availH, scale, dpr, ox, oy, W, H,
+    innerW: window.innerWidth, innerH: window.innerHeight,
+    cw: stage.clientWidth, ch: stage.clientHeight };
 
   const sw = Math.max(1, Math.round(W * scale * dpr));
   const sh = Math.max(1, Math.round(H * scale * dpr));
   sceneCanvas.width = sw;
   sceneCanvas.height = sh;
   sceneCtx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-  scarfCanvas.width = sw;
-  scarfCanvas.height = sh;
-  scarfCtx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-
   const Ht = H * CONFIG.tree.heightRatio;
   const width = Math.min(Ht / CONFIG.tree.widthRatio, W * 0.90);
   const halfW = width * 0.5;
@@ -949,7 +947,6 @@ function envAt(y) {
 /* ============================================================
    7. 动态元素（彩带、圆点、星星、雪、文字）
    ============================================================ */
-let ribbon = null;
 let ornaments = [];
 let lights = [];
 let flakes = [];
@@ -960,124 +957,7 @@ function buildDynamic() {
   rng = mulberry32(CONFIG.seed + 7717);
   const { cx, top, Ht } = G;
 
-  // 丝带：真 3D 缠绕带——中心点沿圆锥面走，带面上下沿只做竖直偏移
-  ribbon = { samples: [], turns: CONFIG.ribbon.turns, th0: 1.26, tailPhase: rrand(0, TAU) };
-  const turns = ribbon.turns;
-  const topY = top + Ht * 0.062;      // 收在星星下方
-  const botY = top + Ht * 0.935;
-  const stepAng = 1.5 * Math.PI / 180;
-  const span = turns * TAU;
-  const M = Math.round(span / stepAng);
-  const bandBoost = clamp(CONFIG.ribbon.ribbonMinWidthPx / (19 * (scale || 1)), 1, CONFIG.ribbon.ribbonMaxWidthPx / 36);
-  for (let k = 0; k <= M; k++) {
-    const t = k / M;
-    const theta = ribbon.th0 + span * t;
-    const yBase = botY - (botY - topY) * t;
-    const env = envAt(yBase);
-    const sinT = Math.sin(theta), cosT = Math.cos(theta);
-    const order = clamp(Math.floor((theta - ribbon.th0) / TAU), 0, turns - 1);   // 0 = 最下圈
-    const fitR = CONFIG.ribbon.ribbonFitRadius[clamp(3 - order, 0, 4)] || 0.985;
-    let R = env.half * fitR - CONFIG.ribbon.ribbonSink;                                // 往树里压 2px
-    let x = env.cx + R * sinT;
-    const lim = env.half * 0.99;
-    if (Math.abs(x - env.cx) > lim) {          // 只缩小半径，带宽不变
-      R = lim / Math.max(0.0001, Math.abs(sinT));
-      x = env.cx + R * sinT;
-    }
-    // 更平整：带宽 ±2%，中线 ±0.5px
-    // 等带宽：只有名义宽度 × 扭折系数 × ±2% 起伏，不掺任何透视收窄
-    const wB = CONFIG.ribbon.ribbonWidthBottom, wT = CONFIG.ribbon.ribbonWidthTop;
-    const wNom = wB + (wT - wB) * t;
-    let w = wNom * bandBoost * (1 + 0.02 * Math.sin(theta * 2.1 + 1.3));
-    if (w < wNom * 0.82) w = wNom;         // 硬约束：不得出现细线
-    const tilt = (0.10 + 0.06 * (1 - t)) * 0.9;
-    const sag = (1.5 + 1.5 * (1 - t)) * Math.pow(Math.max(0, cosT), 1.6);
-    const y = yBase + R * tilt * cosT + sag + Math.sin(theta * 1.9 + 0.5) * 0.5;
-    ribbon.samples.push({ t, theta, x, y, cos: cosT, sin: sinT, w, R });
-  }
-  // 相邻采样点中线距离 ≤ 3px：过远就插值加密，保证四边形连续无缝
-  {
-    const src = ribbon.samples.slice();
-    const out = [];
-    for (let k = 0; k < src.length - 1; k++) {
-      const a = src[k], b = src[k + 1];
-      out.push(a);
-      const d = Math.hypot(b.x - a.x, b.y - a.y);
-      const n = Math.min(4, Math.max(0, Math.ceil(d / CONFIG.ribbon.ribbonMaxSampleGap) - 1));
-      for (let j = 1; j <= n; j++) {
-        const u = j / (n + 1);
-        out.push({
-          t: a.t + (b.t - a.t) * u,
-          theta: a.theta + (b.theta - a.theta) * u,
-          x: a.x + (b.x - a.x) * u,
-          y: a.y + (b.y - a.y) * u,
-          cos: a.cos + (b.cos - a.cos) * u,
-          sin: a.sin + (b.sin - a.sin) * u,
-          w: a.w + (b.w - a.w) * u,
-          R: a.R + (b.R - a.R) * u
-        });
-      }
-    }
-    out.push(src[src.length - 1]);
-    ribbon.samples = out;
-  }
-  // 弧长，用来排布虚线缝线
-  let acc = 0;
-  ribbon.samples[0].s = 0;
-  for (let k = 1; k < ribbon.samples.length; k++) {
-    const a = ribbon.samples[k - 1], b = ribbon.samples[k];
-    acc += Math.hypot(b.x - a.x, b.y - a.y);
-    b.s = acc;
-  }
-  ribbon.M = M;
-  ribbon.topY = topY;
-  ribbon.botY = botY;
-
-  // 前景针叶压边：把围巾边缘盖住一点，像嵌在枝叶里
-  ribbon.needles = [];
-  const ndN = perf.mode === 'on' ? 16 : 22;
-  const ndCand = [];
-  for (let i = 0; i < ribbon.samples.length; i++) {
-    if (ribbon.samples[i].cos > 0.35) ndCand.push(i);
-  }
-  for (let n = 0; n < ndN && ndCand.length; n++) {
-    const idx = ndCand[Math.floor(rng() * ndCand.length)];
-    const a = ribbon.samples[idx];
-    const dir = n % 2 ? 1 : -1;
-    const long = n % 5 === 0;
-    ribbon.needles.push({
-      x: a.x + (rng() - 0.5) * a.w * 0.6,
-      y: a.y + dir * a.w * 0.5,
-      dx: (rng() - 0.5) * 5,
-      dy: -dir * (long ? 8 + rng() * 6 : 2 + rng() * 3),
-      w: 1.1 + rng() * 0.7,
-      bright: rng() > 0.55,
-      cos: a.cos,
-      sNorm: idx / Math.max(1, ribbon.samples.length - 1)
-    });
-  }
-  // 上边缘的小雪堆（避开条纹）
-  ribbon.snowCaps = [];
-  const capCount = perf.mode === 'on' ? 3 : (5 + Math.floor(rng() * 4));
-  const caps = [];
-  for (let i = 0; i < ribbon.samples.length; i++) {
-    const a = ribbon.samples[i];
-    if (a.cos < 0.55) continue;
-    if (ribbonInStripe(a.theta, 4.5)) continue;
-    caps.push(i);
-  }
-  for (let c = 0; c < capCount && caps.length; c++) {
-    const idx = caps[Math.floor(rng() * caps.length)];
-    const a = ribbon.samples[idx];
-    ribbon.snowCaps.push({
-      x: a.x,
-      y: a.y - a.w * 0.5,
-      rx: (8 + rng() * 12) * clamp(Ht / 620, 0.7, 1.2),
-      ry: 2 + rng() * 2,
-      ph: rng() * TAU
-    });
-  }
-
+  // 围巾几何在 scarfInit() 里单独构建
   // 装饰：全部挂到各层下沿的羽毛尖端下方，不再挂在丝带上
   ornaments = [];
   const types = ['ball', 'drop', 'flake', 'bell', 'star'];
@@ -1706,842 +1586,6 @@ function drawTreeLayer() {
   }
 }
 
-function ribbonGrow() {
-  if (ribbonFullMode) return 1;
-  return clamp((vt - 6.5) / 2.8, 0, 1);
-}
-
-function ribbonSelfCheck() {
-  if (!ribbon || !ribbon.samples.length) return;
-  const s = ribbon.samples;
-  let maxOut = -999, badQuads = 0, wMin = 1e9, wMax = 0, worst = null;
-  for (let i = 0; i < s.length; i++) {
-    const a = s[i];
-    wMin = Math.min(wMin, a.w);
-    wMax = Math.max(wMax, a.w);
-    if (a.cos > 0) {
-      const e = envAt(a.y);
-      const out = Math.abs(a.x - e.cx) - e.half * 0.99;
-      if (out > maxOut) { maxOut = out; worst = { x: a.x, y: a.y, w: a.w, half: e.half, cx: e.cx }; }
-    }
-    if (i < s.length - 1) {
-      const b = s[i + 1];
-      // 共享边的四边形天然连续，这里只统计中线跨度过大的采样
-      if (Math.abs(b.y - a.y) > a.w * 0.15) badQuads++;
-    }
-  }
-  const ratio = wMax / wMin;
-  // 新增：最小带宽比（名义宽度）与相邻样本间距
-  let minRatio = 1e9, maxGap = 0, maxMid = 0;
-  for (let i = 0; i < s.length; i++) {
-    const a = s[i];
-    const t = a.t == null ? 0 : a.t;
-    const wNom = CONFIG.ribbon.ribbonWidthBottom + (CONFIG.ribbon.ribbonWidthTop - CONFIG.ribbon.ribbonWidthBottom) * t;
-    minRatio = Math.min(minRatio, a.w / wNom);
-    if (i < s.length - 1) {
-      const b = s[i + 1];
-      maxGap = Math.max(maxGap, Math.hypot(b.x - a.x, b.y - a.y));
-      maxMid = Math.max(maxMid, Math.abs(b.y - a.y) / a.w);
-    }
-  }
-  if (badQuads > 0) console.warn('[ribbon] flipped quads: ' + badQuads);
-  if (ratio > 1.15) console.log('[ribbon] nominal taper ratio ' + ratio.toFixed(3));
-  if (maxOut > 0.5) console.warn('[ribbon] front outside envelope by ' + maxOut.toFixed(2), worst);
-  if (minRatio < CONFIG.ribbon.ribbonMinWidthRatio) console.warn('[ribbon] thin band ' + minRatio.toFixed(3));
-  if (maxGap > CONFIG.ribbon.ribbonMaxSampleGap + 0.5) console.warn('[ribbon] sample gap ' + maxGap.toFixed(2));
-  if (maxMid > 0.15) console.warn('[ribbon] mid jump ' + maxMid.toFixed(3));
-  console.log('[ribbon] turns=' + ribbon.turns + ' samples=' + s.length +
-              ' maxOut=' + maxOut.toFixed(2) + ' wRatio=' + ratio.toFixed(3) +
-              ' minRatio=' + minRatio.toFixed(3) + ' maxGap=' + maxGap.toFixed(2) +
-              ' badQuads=' + badQuads);
-}
-function ribbonRel(theta) {
-  let rel = (theta - ribbon.th0) % TAU;
-  if (rel < 0) rel += TAU;
-  return rel > Math.PI ? rel - TAU : rel;
-}
-
-function ribbonFrontAlpha(c) {
-  return c >= 0 ? 1 : clamp((c + 0.15) / 0.15, 0, 1);
-}
-
-function ribbonSampleAt(theta) {
-  const s = ribbon.samples;
-  const u = (theta - ribbon.th0) / (ribbon.turns * TAU);
-  if (u < 0 || u > 1) return null;
-  const idx = clamp(u * (s.length - 1), 0, s.length - 1);
-  const i0 = Math.floor(idx), i1 = Math.min(s.length - 1, i0 + 1);
-  const f = idx - i0;
-  const a = s[i0], b = s[i1];
-  return {
-    x: a.x + (b.x - a.x) * f,
-    y: a.y + (b.y - a.y) * f,
-    w: a.w + (b.w - a.w) * f,
-    cos: Math.cos(theta)
-  };
-}
-
-function ribbonSmooth(a, b, x) {
-  const t = clamp((x - a) / (b - a), 0, 1);
-  return t * t * (3 - 2 * t);
-}
-
-function ribbonStripeGroups() {
-  const deg = Math.PI / 180;
-  const out = [];
-  const end = ribbon.th0 + ribbon.turns * TAU;
-  for (let n = 0; n <= ribbon.turns; n++) {
-    for (const c of [-30 * deg, 26 * deg]) {
-      let ang = n * TAU + c;
-      while (ang < ribbon.th0) ang += TAU;
-      if (ang > end) continue;
-      out.push(ang);
-    }
-  }
-  return out;
-}
-
-function ribbonInStripe(theta, padDeg) {
-  const span = (4.2 + (padDeg || 0)) * Math.PI / 180;
-  for (const c of ribbonStripeGroups()) {
-    if (Math.abs(theta - c) <= span) return true;
-  }
-  return false;
-}
-
-function ribbonQuadB(t1, t2, col, alpha, dy) {
-  const a = ribbonSampleAt(t1), b = ribbonSampleAt(t2);
-  if (!a || !b) return;
-  ctx.globalAlpha = alpha;
-  ctx.fillStyle = col;
-  ctx.beginPath();
-  ctx.moveTo(a.x, a.y - a.w * 0.5 + (dy || 0));
-  ctx.lineTo(b.x, b.y - b.w * 0.5 + (dy || 0));
-  ctx.lineTo(b.x, b.y + b.w * 0.5 + (dy || 0));
-  ctx.lineTo(a.x, a.y + a.w * 0.5 + (dy || 0));
-  ctx.closePath();
-  ctx.fill();
-}
-
-function drawRibbonBand(front, themeNow) {
-  if (!ribbon || !front) return;
-  const s = ribbon.samples;
-  const p = ribbonGrow();
-  if (p <= 0.002) return;
-  const last = Math.min(s.length - 1, Math.floor(p * (s.length - 1)));
-  const main = themeNow.ribbon[0];
-  const light = themeNow.ribbonLight || mix(main, themeNow.ribbon[1], 0.85);
-  const dark = themeNow.ribbonDark || shade(main, -0.35);
-  const cream = themeNow.ribbonStripe || '#f5ead6';
-  const stripe2 = themeNow.ribbonStripe2 || themeNow.ornaments[1];
-  const shadow = mix(themeNow.treeShadow, themeNow.bg, 0.42);
-  const deg = Math.PI / 180;
-  const endTheta = ribbon.th0 + ribbon.turns * TAU;
-
-  ctx.save();
-  ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
-
-  // ---- 投影：贴得很紧，偏移 (1, 2.5)，用多层柔和叠加代替模糊 ----
-  const segStep = perf.mode === 'on' ? 2 : 1;
-  ctx.fillStyle = shadow;
-  for (let i = 0; i < last; i += segStep) {
-    const j = Math.min(last, i + segStep);
-    const a = s[i], b = s[j];
-    const al = ribbonFrontAlpha(Math.min(a.cos, b.cos));
-    if (al <= 0.02) continue;
-    for (let l = 0; l < 3; l++) {
-      const o = 2.5 + l * 1.6;
-      ctx.globalAlpha = (0.5 - l * 0.12) * al;
-      ctx.beginPath();
-      ctx.moveTo(a.x + 1, a.y - a.w * 0.5 + o);
-      ctx.lineTo(b.x + 1, b.y - b.w * 0.5 + o);
-      ctx.lineTo(b.x + 1, b.y + b.w * 0.5 + o);
-      ctx.lineTo(a.x + 1, a.y + a.w * 0.5 + o);
-      ctx.closePath();
-      ctx.fill();
-    }
-  }
-  ctx.globalAlpha = 1;
-
-  // ---- 布带面：上 8% 提亮、下 12% 压暗，中线随机起伏 ----
-  for (let i = 0; i < last; i += segStep) {
-    const j = Math.min(last, i + segStep);
-    const a = s[i], b = s[j];
-    const al = ribbonFrontAlpha(Math.min(a.cos, b.cos));
-    if (al <= 0.004) continue;
-    const cMid = (a.cos + b.cos) * 0.5;
-    const sinMid = (a.sin + b.sin) * 0.5;
-    const faceT = 0.10 + 0.20 * Math.max(0, cMid);
-    const sideT = 0.42 * ribbonSmooth(0.45, 0.95, Math.abs(sinMid));
-    let col = mix(main, light, faceT);
-    if (sideT > 0) col = mix(col, dark, sideT);
-
-    ctx.globalAlpha = al * 0.97;
-    ctx.fillStyle = col;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y - a.w * 0.5);
-    ctx.lineTo(b.x, b.y - b.w * 0.5);
-    ctx.lineTo(b.x, b.y + b.w * 0.5);
-    ctx.lineTo(a.x, a.y + a.w * 0.5);
-    ctx.closePath();
-    ctx.fill();
-    ctx.strokeStyle = col;
-    ctx.lineWidth = 0.7;
-    ctx.stroke();
-
-    // 上棱受光 / 下棱压暗
-    ctx.globalAlpha = al * 0.55;
-    ctx.fillStyle = mix(light, '#ffffff', 0.25);
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y - a.w * 0.5);
-    ctx.lineTo(b.x, b.y - b.w * 0.5);
-    ctx.lineTo(b.x, b.y - b.w * 0.5 + Math.max(1.2, b.w * 0.10));
-    ctx.lineTo(a.x, a.y - a.w * 0.5 + Math.max(1.2, a.w * 0.10));
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.globalAlpha = al * 0.50;
-    ctx.fillStyle = mix(dark, '#000000', 0.10);
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y + a.w * 0.5);
-    ctx.lineTo(b.x, b.y + b.w * 0.5);
-    ctx.lineTo(b.x, b.y + b.w * 0.5 - Math.max(1.4, b.w * 0.12));
-    ctx.lineTo(a.x, a.y + a.w * 0.5 - Math.max(1.4, a.w * 0.12));
-    ctx.closePath();
-    ctx.fill();
-  }
-
-  // ---- 纱线噪点：细颗粒明暗点，让表面有毛线的粗糙感 ----
-  for (let i = 0; i < last; i += 2) {
-    const a = s[i];
-    const al = ribbonFrontAlpha(a.cos);
-    if (al <= 0.03) continue;
-    const f = ribbonSmooth(0.10, 0.50, a.cos);
-    for (let k = 0; k < 3; k++) {
-      const h1 = Math.sin(a.theta * 137.5 + k * 91.3) * 43758.5453;
-      const fy = (h1 - Math.floor(h1));
-      const h2 = Math.sin(a.theta * 311.7 + k * 17.1) * 24634.6345;
-      const fx = (h2 - Math.floor(h2));
-      const x = a.x + (fx - 0.5) * 1.6;
-      const y = a.y + (fy - 0.5) * a.w;
-      if (k % 2 === 0) { ctx.fillStyle = light; ctx.globalAlpha = 0.12 * f; }
-      else { ctx.fillStyle = dark; ctx.globalAlpha = 0.10 * f; }
-      ctx.fillRect(x, y, 0.7, 0.7);
-    }
-  }
-
-  // ---- 织进去的条纹：每圈 2 组，宽条 2.4°/窄条 1.0°，横跨整条带宽 ----
-  for (const c of ribbonStripeGroups()) {
-    const cSample = ribbonSampleAt(c);
-    if (!cSample) continue;
-    const fade = ribbonSmooth(0.10, 0.50, cSample.cos);
-    if (fade <= 0.02) continue;
-    const bands = [
-      [-4.1, -1.7, cream],
-      [-0.5, 0.5, stripe2],
-      [1.7, 4.1, cream]
-    ];
-    for (const bd of bands) {
-      const t1 = Math.max(ribbon.th0, c + bd[0] * deg);
-      const t2 = Math.min(endTheta, c + bd[1] * deg);
-      if (t2 <= t1) continue;
-      ribbonQuadB(t1, t2, bd[2], 0.92 * fade, 0);
-      // 条纹内部上亮下暗
-      ribbonQuadB(t1, t2, mix(bd[2], '#ffffff', 0.15), 0.30 * fade, 0);
-    }
-  }
-
-  // ---- 通长细条纹：下边缘内侧 2px ----
-  for (let i = 0; i < last; i++) {
-    const a = s[i], b = s[i + 1];
-    const al = ribbonFrontAlpha(Math.min(a.cos, b.cos));
-    if (al <= 0.02) continue;
-    ctx.globalAlpha = 0.55 * al;
-    ctx.strokeStyle = stripe2;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y + a.w * 0.5 - 2);
-    ctx.lineTo(b.x, b.y + b.w * 0.5 - 2);
-    ctx.stroke();
-  }
-
-  // ---- 侧面厚度与接缝 ----
-  for (let i = 0; i <= last; i++) {
-    const a = s[i];
-    const k = ribbonSmooth(0.55, 0.95, Math.abs(a.sin));
-    if (k <= 0.02) continue;
-    const al = ribbonFrontAlpha(a.cos);
-    if (al <= 0.01) continue;
-    ctx.globalAlpha = 0.55 * k * al;
-    ctx.strokeStyle = dark;
-    ctx.lineWidth = 5 + 2 * k;
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y - a.w * 0.5 + 1.5);
-    ctx.lineTo(a.x, a.y + a.w * 0.5 - 1.5);
-    ctx.stroke();
-    ctx.globalAlpha = 0.72 * k * al;
-    ctx.strokeStyle = mix(dark, '#000000', 0.25);
-    ctx.lineWidth = 1.1;
-    ctx.beginPath();
-    ctx.moveTo(a.x + (a.sin > 0 ? 2 : -2), a.y - a.w * 0.5 + 2);
-    ctx.lineTo(a.x + (a.sin > 0 ? 2 : -2), a.y + a.w * 0.5 - 2);
-    ctx.stroke();
-  }
-
-  // ---- 横向罗纹：暗线 + 紧挨的亮线，每 1.6°（过密自动回退 2.2°）----
-  const arcPerDeg = (TAU * (G.halfW * 0.8)) / 360;
-  let ribDeg = perf.mode === 'on' ? 2.2 : CONFIG.ribbon.ribbonRibStep;
-  if (arcPerDeg * ribDeg * scale < 1.4) ribDeg = CONFIG.ribbon.ribbonRibFallbackStep;
-  const ribStepAng = ribDeg * deg;
-  for (let th = ribbon.th0; th <= endTheta; th += ribStepAng) {
-    const sm = ribbonSampleAt(th);
-    if (!sm || sm.cos <= 0.02) continue;
-    if (arcPerDeg * ribDeg * scale < 1.2) continue;
-    const fade = ribbonSmooth(0.10, 0.50, sm.cos);
-    const px = sm.w * 0.5;
-    ctx.globalAlpha = 0.42 * fade;
-    ctx.strokeStyle = dark;
-    ctx.lineWidth = 0.8;
-    ctx.beginPath();
-    ctx.moveTo(sm.x, sm.y - px + 0.8);
-    ctx.lineTo(sm.x, sm.y + px - 0.8);
-    ctx.stroke();
-    ctx.globalAlpha = 0.32 * fade;
-    ctx.strokeStyle = light;
-    ctx.lineWidth = 0.6;
-    ctx.beginPath();
-    ctx.moveTo(sm.x + 0.8, sm.y - px + 1.4);
-    ctx.lineTo(sm.x + 0.8, sm.y + px - 1.4);
-    ctx.stroke();
-  }
-
-  // ---- V 形针脚：两排错位鱼骨 ----
-  let row = 0;
-  for (let th = ribbon.th0; th <= endTheta; th += ribStepAng) {
-    const sm = ribbonSampleAt(th);
-    if (!sm || sm.cos <= 0.02) continue;
-    const fade = ribbonSmooth(0.10, 0.50, sm.cos);
-    if (fade <= 0.03) continue;
-    const px = sm.w * 0.5;
-    const offY = row % 2 ? px * 0.16 : -px * 0.16;
-    const len = sm.w * 0.26;
-    const vy = len * 0.56, hx = len * 0.42;
-    ctx.globalAlpha = 0.26 * fade;
-    ctx.strokeStyle = light;
-    ctx.lineWidth = 1;
-    ctx.beginPath();
-    ctx.moveTo(sm.x - hx, sm.y + offY - vy);
-    ctx.lineTo(sm.x + hx, sm.y + offY);
-    ctx.lineTo(sm.x - hx, sm.y + offY + vy);
-    ctx.stroke();
-    row++;
-  }
-
-  // ---- 边缘虚线缝线（内侧 3px，短针脚 2.4 / 间隔 1.8）----
-  const stitchPeriod = CONFIG.ribbon.ribbonStitchLen + CONFIG.ribbon.ribbonStitchGap;
-  for (const dir of [-1, 1]) {
-    ctx.strokeStyle = light;
-    ctx.lineWidth = 0.8;
-    for (let i = 0; i < last; i++) {
-      const a = s[i], b = s[i + 1];
-      const al = ribbonFrontAlpha(Math.min(a.cos, b.cos));
-      if (al <= 0.03) continue;
-      const phase = a.s % stitchPeriod;
-      if (phase > CONFIG.ribbon.ribbonStitchLen) continue;
-      const segLen = Math.max(0.001, b.s - a.s);
-      const u0 = Math.min(1, phase / segLen);
-      const u1 = Math.min(1, (CONFIG.ribbon.ribbonStitchLen - phase >= segLen ? 1 : (CONFIG.ribbon.ribbonStitchLen - phase) / segLen));
-      if (u1 <= u0) continue;
-      const x0 = a.x + (b.x - a.x) * u0, y0 = a.y + (b.y - a.y) * u0;
-      const x1 = a.x + (b.x - a.x) * u1, y1 = a.y + (b.y - a.y) * u1;
-      const wI0 = a.w + (b.w - a.w) * u0, wI1 = a.w + (b.w - a.w) * u1;
-      ctx.globalAlpha = 0.45 * al;
-      ctx.beginPath();
-      ctx.moveTo(x0, y0 + dir * (wI0 * 0.5 - 3));
-      ctx.lineTo(x1, y1 + dir * (wI1 * 0.5 - 3));
-      ctx.stroke();
-    }
-  }
-
-  // ---- 上下轮廓 1px 浅色描边 ----
-  for (const dir of [-1, 1]) {
-    ctx.strokeStyle = mix(light, '#ffffff', 0.30);
-    ctx.lineWidth = 1;
-    for (let i = 0; i < last; i++) {
-      const a = s[i], b = s[i + 1];
-      const al = ribbonFrontAlpha(Math.min(a.cos, b.cos));
-      if (al <= 0.02) continue;
-      ctx.globalAlpha = 0.35 * al;
-      ctx.beginPath();
-      ctx.moveTo(a.x, a.y + dir * a.w * 0.5);
-      ctx.lineTo(b.x, b.y + dir * b.w * 0.5);
-      ctx.stroke();
-    }
-  }
-
-  // ---- 边缘毛边：更短更干净 ----
-  for (let i = 0; i <= last; i += 3) {
-    const a = s[i];
-    const relDeg = Math.abs(ribbonRel(a.theta)) / deg;
-    const edgeFade = 1 - ribbonSmooth(70, 90, relDeg);
-    const fade = ribbonSmooth(0.10, 0.50, a.cos) * edgeFade;
-    if (fade <= 0.02) continue;
-    const px = a.w * 0.5;
-    const strands = perf.mode === 'on' ? 1 : (i % 2 ? 1 : 2);
-    for (let k = 0; k < strands; k++) {
-      const dir = (i + k) % 2 ? 1 : -1;
-      const jitter = (rng() - 0.5) * 2.2;
-      ctx.globalAlpha = (0.30 + rng() * 0.20) * fade;
-      ctx.strokeStyle = light;
-      ctx.lineWidth = 0.65;
-      ctx.beginPath();
-      ctx.moveTo(a.x + jitter, a.y + dir * px);
-      ctx.lineTo(a.x + jitter + (rng() - 0.5) * 1.2, a.y + dir * (px + 1 + rng() * 1.4));
-      ctx.stroke();
-    }
-  }
-
-  // ---- 上边缘积雪 ----
-  if (ribbon.snowCaps && ribbon.snowCaps.length) {
-    ctx.save();
-    ctx.filter = 'blur(1.2px)';
-    for (const cap of ribbon.snowCaps) {
-      const x = cap.x + Math.sin(vt * 0.6 + cap.ph) * 0.8;
-      ctx.globalAlpha = 0.86;
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.ellipse(x, cap.y - 0.5, cap.rx, cap.ry, 0, 0, TAU);
-      ctx.fill();
-      ctx.globalAlpha = 0.35;
-      ctx.fillStyle = '#8fa8b8';
-      ctx.beginPath();
-      ctx.ellipse(x, cap.y + cap.ry * 0.7, cap.rx * 0.9, 1.2, 0, 0, TAU);
-      ctx.fill();
-    }
-    ctx.restore();
-    ctx.globalAlpha = 1;
-  }
-
-  // ---- 生长前端亮点 ----
-  if (p < 1) {
-    const a = s[last];
-    const r = 11;
-    const g = ctx.createRadialGradient(a.x, a.y, 0, a.x, a.y, r);
-    g.addColorStop(0, 'rgba(255,255,255,0.55)');
-    g.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.globalAlpha = 1;
-    ctx.fillStyle = g;
-    ctx.beginPath();
-    ctx.arc(a.x, a.y, r, 0, TAU);
-    ctx.fill();
-  }
-
-  ctx.restore();
-  ctx.globalAlpha = 1;
-}
-
-function drawRibbonBack(themeNow) {
-  // 背面被树体遮挡：约束在轮廓内，不额外绘制
-}
-
-function drawRibbon(themeNow) {
-  if (!ribbon) return;
-  drawRibbonTails(themeNow);
-  drawRibbonBand(true, themeNow);
-}
-
-function drawScarf(themeNow) {
-  if (!ribbon) return;
-  const main = ctx;
-  const p = ribbonGrow();
-  const cur = fullFor(themeState.cur, true);
-  const fromF = trans ? fullFor(trans.from, true) : null;
-  const toF = trans ? fullFor(trans.to, true) : null;
-
-  ctx = scarfCtx;
-  ctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-  ctx.globalAlpha = 1;
-  ctx.globalCompositeOperation = 'source-over';
-  ctx.clearRect(0, 0, W, H);
-
-  const drawOne = (item, alpha) => {
-    if (!item) return;
-    revealScarf(item, p);
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.drawImage(item.shown, 0, 0, W, H);
-    ctx.restore();
-  };
-
-  if (trans && fromF && toF) {
-    const k = easeInOut(clamp((vt - trans.t0) / trans.dur, 0, 1));
-    drawOne(fromF, 1 - k);
-    drawOne(toF, k);
-  } else if (cur) {
-    drawOne(cur, 1);
-  } else {
-    drawRibbonTails(themeNow);
-    drawRibbonBand(true, themeNow);
-  }
-
-  ctx = main;
-  ctx.drawImage(scarfCanvas, 0, 0, W, H);
-  drawScarfNeedles(themeNow);
-}
-
-// 增量揭示：每帧只把新到达的切片从完整贴图搬到 scarfShown
-function revealScarf(item, p) {
-  const s = ribbon.samples;
-  const N = s.length;
-  const target = Math.min(N - 1, Math.floor(p * (N - 1)));
-  const S = CONFIG.ribbon.scarfSliceCount || 60;
-  const per = Math.max(1, Math.ceil((N - 1) / S));
-  const c = item.shownCtx;
-  let upto = item.sliceUpto || 0;
-  while (upto < N - 1) {
-    const i0 = upto, i1 = Math.min(N - 1, i0 + per);
-    if (i1 > target) break;
-    c.save();
-    c.beginPath();
-    for (let i = i0; i < i1; i++) {
-      const a = s[i], b = s[i + 1];
-      c.moveTo(a.x, a.y - a.w * 0.5 - 1);
-      c.lineTo(b.x, b.y - b.w * 0.5 - 1);
-      c.lineTo(b.x, b.y + b.w * 0.5 + 1);
-      c.lineTo(a.x, a.y + a.w * 0.5 + 1);
-      c.closePath();
-    }
-    c.clip();
-    c.drawImage(item.canvas, 0, 0, W, H);
-    c.restore();
-    upto = i1;
-    item.sliceUpto = upto;
-  }
-  if (p >= 0.02 && !item.tailShown && ribbon.tailRect) {
-    const r = ribbon.tailRect;
-    c.save();
-    c.beginPath();
-    c.rect(r.x, r.y, r.w, r.h);
-    c.clip();
-    c.drawImage(item.canvas, 0, 0, W, H);
-    c.restore();
-    item.tailShown = true;
-  }
-  if (p >= 0.985 && !item.knotShown && ribbon.knotRect) {
-    const r = ribbon.knotRect;
-    c.save();
-    c.beginPath();
-    c.rect(r.x, r.y, r.w, r.h);
-    c.clip();
-    c.drawImage(item.canvas, 0, 0, W, H);
-    c.restore();
-    item.knotShown = true;
-  }
-}
-
-// 围巾完整贴图：每个主题一张，构建完成后只做映射与揭示
-let ribbonFullMode = false;
-const scarfFulls = new Map();
-
-function scarfFullKey(i) {
-  return i + '|' + scarfCanvas.width + 'x' + scarfCanvas.height;
-}
-
-function buildScarfFull(i) {
-  if (!ribbon || !ribbon.samples.length) return null;
-  const key = scarfFullKey(i);
-  if (scarfFulls.has(key)) return scarfFulls.get(key);
-  const cv = document.createElement('canvas');
-  cv.width = scarfCanvas.width;
-  cv.height = scarfCanvas.height;
-  const c = cv.getContext('2d');
-  c.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-  const main = ctx;
-  const oldVt = vt;
-  ctx = c;
-  ribbonFullMode = true;
-  vt = 0;
-  try {
-    drawRibbonTails(THEMES[i]);
-    drawRibbonBand(true, THEMES[i]);
-  } catch (err) {
-    console.warn('[scarf] build error', err);
-  } finally {
-    ribbonFullMode = false;
-    vt = oldVt;
-    ctx = main;
-  }
-  const shown = document.createElement('canvas');
-  shown.width = cv.width;
-  shown.height = cv.height;
-  const shownCtx = shown.getContext('2d');
-  shownCtx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-  const item = { canvas: cv, shown: shown, shownCtx: shownCtx, key: key, ready: true, sliceUpto: 0, tailShown: false, knotShown: false };
-  scarfFulls.set(key, item);
-  // 只保留当前与下一个主题
-  for (const k of Array.from(scarfFulls.keys())) {
-    if (k !== scarfFullKey(themeState.cur) && k !== scarfFullKey((themeState.cur + 1) % THEMES.length)) {
-      scarfFulls.delete(k);
-    }
-  }
-  scarfCheck(item);
-  return item;
-}
-
-function fullFor(i, kick) {
-  const key = scarfFullKey(i);
-  const hit = scarfFulls.get(key);
-  if (hit) return hit;
-  if (kick) kickScarfFull(i);
-  return null;
-}
-
-let scarfKickTimer = 0, scarfKicking = -1;
-function kickScarfFull(i) {
-  if (scarfFulls.has(scarfFullKey(i))) return;
-  scarfKicking = i;
-  if (scarfKickTimer) return;
-  scarfKickTimer = setTimeout(() => {
-    scarfKickTimer = 0;
-    const idx = scarfKicking;
-    scarfKicking = -1;
-    if (idx >= 0) buildScarfFull(idx);
-  }, 0);
-}
-
-function scarfCheck(item) {
-  if (!item) return;
-  try {
-    const c = item.canvas.getContext('2d');
-    const w = item.canvas.width, h = item.canvas.height;
-    let any = 0, tested = 0;
-    if (w > 8 && h > 8) {
-      const d = c.getImageData(0, 0, w, h).data;
-      for (let y = 4; y < h; y += Math.max(8, Math.floor(h / 24))) {
-        for (let x = 4; x < w; x += Math.max(8, Math.floor(w / 24))) {
-          tested++;
-          if (d[(y * w + x) * 4 + 3] > 8) any++;
-        }
-      }
-    }
-    if (tested && any === 0) console.warn('[scarf] full layer empty');
-  } catch (e) { /* 忽略 */ }
-}
-
-// 按弧长揭示：同一 s 位置的底色、纹理、条纹、缝线一起露出
-function scarfRevealClip(p) {
-  const s = ribbon.samples;
-  if (p >= 1) return;
-  const last = Math.max(0, Math.min(s.length - 1, Math.floor(p * (s.length - 1))));
-  ctx.beginPath();
-  for (let i = 0; i < last; i++) {
-    const a = s[i], b = s[i + 1];
-    ctx.moveTo(a.x, a.y - a.w * 0.5);
-    ctx.lineTo(b.x, b.y - b.w * 0.5);
-    ctx.lineTo(b.x, b.y + b.w * 0.5);
-    ctx.lineTo(a.x, a.y + a.w * 0.5);
-    ctx.closePath();
-  }
-  ctx.clip();
-}
-
-// 前景针叶压边：画在图层之上，不缓存，主题切换不会残留旧色
-function drawScarfNeedles(themeNow) {
-  if (!ribbon.needles || !ribbon.needles.length) return;
-  const p = ribbonGrow();
-  ctx.save();
-  ctx.lineCap = 'round';
-  for (const nd of ribbon.needles) {
-    if (nd.sNorm > p) continue;
-    const fade = ribbonSmooth(0.10, 0.50, nd.cos);
-    if (fade <= 0.02) continue;
-    ctx.globalAlpha = 0.55 * fade;
-    ctx.strokeStyle = nd.bright ? themeNow.treeHighlight : themeNow.treeLight;
-    ctx.lineWidth = nd.w;
-    ctx.beginPath();
-    ctx.moveTo(nd.x, nd.y);
-    ctx.lineTo(nd.x + nd.dx, nd.y + nd.dy);
-    ctx.stroke();
-  }
-  ctx.restore();
-  ctx.globalAlpha = 1;
-}
-
-function drawRibbonTails(themeNow) {
-  const p = ribbonGrow();
-  if (p <= 0.02) return;
-  const s = ribbon.samples;
-  const main = themeNow.ribbon[0];
-  const light = themeNow.ribbonLight || mix(main, themeNow.ribbon[1], 0.85);
-  const dark = themeNow.ribbonDark || shade(main, -0.35);
-  const cream = themeNow.ribbonStripe || '#f5ead6';
-  const stripe2 = themeNow.ribbonStripe2 || themeNow.ornaments[1];
-
-  ctx.save();
-  ctx.lineJoin = 'round';
-  ctx.lineCap = 'round';
-
-  // ---- 下端长尾：挂在最下圈右侧前段（θ≈+42°）的下边缘，沿右轮廓垂下 ----
-  const a0 = s[Math.round((s.length - 1) * 0.03)];
-  const e0 = envAt(a0.y);
-  const w0 = a0.w * 0.85;
-  const x0 = Math.min(a0.x, e0.cx + e0.half - w0 * 0.5 - 3);
-  const y0 = a0.y + a0.w * 0.5 - 1;
-  const len = Math.min(72, Math.max(56, G.yBot - y0 - 14));
-  const segs = 26;
-  const swing = Math.sin(vt * (TAU / 5) + ribbon.tailPhase) * 1.6 * Math.PI / 180;
-  const pts = [];
-  for (let j = 0; j <= segs; j++) {
-    const u = j / segs;
-    const sy = y0 + len * u;
-    const e = envAt(sy);
-    const legal = e.cx + e.half - w0 * 0.5 - 4;
-    const lean = -2 * u;
-    const sway = Math.sin(swing) * len * u * 0.55;
-    pts.push({ x: Math.min(legal, Math.max(e.cx, x0 + lean + sway)), y: sy, w: w0 * (1 - 0.06 * u) });
-  }
-
-  // 交接处褶皱阴影
-  ctx.globalAlpha = 0.5;
-  ctx.fillStyle = hexA(themeNow.ribbonShadow || dark, 0.55);
-  ctx.beginPath();
-  ctx.ellipse(x0, y0 + 2, w0 * 0.42, 4, 0, 0, TAU);
-  ctx.fill();
-
-  // 尾巴布面
-  ctx.globalAlpha = 0.96;
-  ctx.fillStyle = main;
-  ctx.beginPath();
-  for (let j = 0; j <= segs; j++) {
-    const q = pts[j];
-    if (j === 0) ctx.moveTo(q.x - q.w * 0.5, q.y); else ctx.lineTo(q.x - q.w * 0.5, q.y);
-  }
-  const e = pts[segs];
-  ctx.lineTo(e.x + e.w * 0.42, e.y + 9);          // 斜剪口
-  ctx.lineTo(e.x + e.w * 0.5, e.y);
-  for (let j = segs; j >= 0; j--) {
-    const q = pts[j];
-    ctx.lineTo(q.x + q.w * 0.5, q.y);
-  }
-  ctx.closePath();
-  ctx.fill();
-
-  // 末端条纹（距末端 10 / 20px）
-  for (const dy of [10, 20]) {
-    const yy = e.y - dy;
-    const q = pts[Math.max(0, Math.round((yy - pts[0].y) / (len / segs)))];
-    if (!q) continue;
-    ctx.globalAlpha = 0.62;
-    ctx.strokeStyle = dy === 10 ? cream : stripe2;
-    ctx.lineWidth = dy === 10 ? 2.8 : 2;
-    ctx.beginPath();
-    ctx.moveTo(q.x - q.w * 0.5 + 1, yy);
-    ctx.lineTo(q.x + q.w * 0.5 - 1, yy);
-    ctx.stroke();
-  }
-
-  // 锁边缝线（距末端 6px）
-  ctx.globalAlpha = 0.5;
-  ctx.strokeStyle = light;
-  ctx.lineWidth = 0.9;
-  ctx.setLineDash([2.4, 1.8]);
-  ctx.beginPath();
-  ctx.moveTo(e.x - e.w * 0.5 + 1, e.y - 6);
-  ctx.lineTo(e.x + e.w * 0.5 - 1, e.y - 6);
-  ctx.stroke();
-  ctx.setLineDash([]);
-
-  // 流苏：4 束 × 3 根，每根两股细线
-  ctx.globalAlpha = 0.78;
-  for (let b = 0; b < 4; b++) {
-    const base = (-0.5 + b / 3.6) * e.w * 0.86;
-    for (let j = 0; j < 3; j++) {
-      const off = base + j * 1.6;
-      const fl = 10 + ((b * 3 + j) % 4) * 1.5;
-      const sw = Math.sin(vt * 1.4 + (b * 3 + j) * 0.8 + ribbon.tailPhase) * 2.0;
-      ctx.strokeStyle = (b + j) % 2 ? cream : light;
-      ctx.lineWidth = 0.9;
-      ctx.beginPath();
-      ctx.moveTo(e.x + off - 0.5, e.y + 4);
-      ctx.lineTo(e.x + off - 0.5 + sw, e.y + 4 + fl);
-      ctx.stroke();
-      ctx.globalAlpha = 0.5;
-      ctx.beginPath();
-      ctx.moveTo(e.x + off + 0.5, e.y + 4.5);
-      ctx.lineTo(e.x + off + 0.5 + sw * 1.1, e.y + 4 + fl - 1);
-      ctx.stroke();
-      ctx.globalAlpha = 0.78;
-    }
-  }
-
-  // ---- 顶端：星星下方打结 + 短尾，随生长进度一起出现 ----
-  if (p >= 0.985) {
-    const aT = s[s.length - 1];
-    const kx = aT.x;
-    const ky = aT.y + aT.w * 0.2;
-    const kw = aT.w * 1.35;
-    ctx.globalAlpha = 0.95;
-    ctx.fillStyle = main;
-    ctx.beginPath();
-    ctx.ellipse(kx, ky, kw * 0.5, aT.w * 0.5, 0.18, 0, TAU);
-    ctx.fill();
-    ctx.globalAlpha = 0.42;
-    ctx.strokeStyle = light;
-    ctx.lineWidth = 1;
-    for (let k = 0; k < 2; k++) {
-      ctx.beginPath();
-      ctx.ellipse(kx, ky, aT.w * (0.40 + k * 0.10), aT.w * 0.28, 0.18, 0.2, Math.PI + 0.2);
-      ctx.stroke();
-    }
-
-    const ty = ky + 24;
-    const te = envAt(ty);
-    const tx = clamp(kx - aT.w * 0.3, te.cx - te.half + 14, te.cx + te.half - 14);
-    ctx.globalAlpha = 0.9;
-    ctx.fillStyle = mix(main, light, 0.10);
-    ctx.beginPath();
-    ctx.moveTo(kx - aT.w * 0.30, ky + 5);
-    ctx.lineTo(kx + aT.w * 0.26, ky + 5);
-    ctx.lineTo(tx + aT.w * 0.20, ty);
-    ctx.lineTo(tx - aT.w * 0.24, ty);
-    ctx.closePath();
-    ctx.fill();
-
-    ctx.globalAlpha = 0.68;
-    for (let k = 0; k < 5; k++) {
-      const off = (-0.5 + k / 4) * aT.w * 0.40;
-      ctx.strokeStyle = k % 2 ? cream : light;
-      ctx.lineWidth = 1.0;
-      ctx.beginPath();
-      ctx.moveTo(tx + off, ty);
-      ctx.lineTo(tx + off + Math.sin(vt * 1.2 + k) * 1.0, ty + 6 + (k % 4));
-      ctx.stroke();
-    }
-  }
-
-  // 记录尾巴与顶端结的包围盒，揭示时按接点放出
-  ribbon.tailRect = {
-    x: Math.min(x0, e.x) - w0 * 0.9 - 14,
-    y: y0 - 8,
-    w: Math.abs(e.x - x0) + w0 * 1.9 + 28,
-    h: (e.y + 26) - (y0 - 8)
-  };
-  {
-    const aK = s[s.length - 1];
-    const kw = aK.w * 1.35;
-    ribbon.knotRect = {
-      x: aK.x - kw - 18,
-      y: aK.y - aK.w * 0.4 - 14,
-      w: kw * 2 + 36,
-      h: aK.w * 1.8 + 70
-    };
-  }
-
-  ctx.restore();
-  ctx.globalAlpha = 1;
-}
-
 function drawSnowBase(themeNow) {
   const { cx, yBot, halfW, Ht } = G;
   for (let i = 0; i < 9; i++) {
@@ -3095,7 +2139,7 @@ function startTransition(target) {
   if (target < 0 || target >= THEMES.length) return;
   if (vt < CONFIG.totalDuration) return;
   if (!caches[target] || !caches[target].ready) renderCacheNow(target);
-  if (scarfGeo && !scarfItems.get(target)) createScarfItem(target);
+  scarfItemFor(target);
   if (!trans && target === themeState.cur) return;
   let from = themeState.cur;
   if (trans) {
@@ -3269,527 +2313,806 @@ function autoTick() {
 }
 
 /* ============================================================
-   11b. 围巾模块（图集 + 路径切片，重做版）
+   11b. 围巾：真 3D 螺旋网格 + 针织贴图（整体重做）
    ============================================================ */
-const SC = {
-  turns: 4, widthBottom: 36, widthTop: 19, minWidthPx: 8, maxWidthPx: 44,
-  fit: [0.985, 0.985, 0.93, 0.985],   // 由上到下
-  sagMin: 1.5, sagMax: 3, wobble: 0.8, thickness: 6,
-  ribPitch: 2.6, stripeGroups: 2, stitchLen: 2.4, stitchGap: 1.8,
-  twist: true, twistMin: 0.6, twistMaxDeg: 6,
-  atlasStepDeg: 0.075, sliceDeg: 0.3, sliceOverlap: 0.5,
-  growDuration: 2.8, shadowOffset: [1, 2.5], shadowAlpha: 0.45,
-  tailLen: [56, 72], fringeCount: [10, 12], debug: false
+const SC = CONFIG.scarf;
+
+const scarfState = {
+  geo: null, items: new Map(), gen: 0,
+  startT: 0, lastP: -1, bakeMs: 0, revealMs: 0
 };
 
-let scarfGeo = null;
-const scarfItems = new Map();
-
-function buildScarfGeo() {
-  const Ht = G.Ht;
-  scarfGeo = { rings: [], topY: G.top, stepDeg: SC.sliceDeg };
-  const A0 = -80, A1 = 80, SPAN = 160;
-  scarfGeo.A0 = A0; scarfGeo.A1 = A1; scarfGeo.SPAN = SPAN;
-
-  const yTopRing = G.top + Ht * 0.18;
-  const yBotRing = G.top + Ht * 0.90;
-  const gap = (yBotRing - yTopRing) / 3;
-  scarfGeo.gap = gap;
-  const bandBoost = clamp(SC.minWidthPx / (SC.widthTop * (scale || 1)), 1, SC.maxWidthPx / SC.widthBottom);
-  for (let k = 0; k < 4; k++) {
-    const frac = k / 3;                        // 0 底 → 3 顶
-    const wNom = (SC.widthBottom + (SC.widthTop - SC.widthBottom) * frac) * bandBoost;
-    const fit = SC.fit[3 - k];
-    const kp = 0.12 + 0.08 * (1 - frac);
-    const sagBase = SC.sagMin + (SC.sagMax - SC.sagMin) * (1 - frac);
-    const yc = yBotRing - gap * k;
-    const climb = gap * 0.5;
-    const ring = { k, wNom, fit, kp, sagBase, yc, climb, pts: [] };
-    const a0 = A0, a1 = A1;
-    const n = Math.round((a1 - a0) / SC.sliceDeg);
-    for (let i = 0; i <= n; i++) {
-      const a = a0 + i * SC.sliceDeg;
-      ring.pts.push(scarfPoint(ring, a));
-    }
-    scarfGeo.rings.push(ring);
-  }
+function scarfLayer(res) {
+  const cv = document.createElement('canvas');
+  const k = scale * dpr * res;
+  cv.width = Math.max(1, Math.round(W * k));
+  cv.height = Math.max(1, Math.round(H * k));
+  const c = cv.getContext('2d');
+  c.setTransform(k, 0, 0, k, 0, 0);
+  return { cv: cv, ctx: c, k: k };
 }
 
-function scarfEnv(y) {
-  let half = 1e9;
-  for (let i = 0; i < G.layers.length; i++) {
-    const L = G.layers[i];
-    if (y <= L.yBottom && y >= L.yTop) {
-      const u = clamp((y - L.yTop) / L.h, 0, 1);       // 0 顶 → 1 底
-      half = Math.min(half, L.hw * (0.22 + 0.78 * u));
-    }
+/* ---------- 几何 ---------- */
+function scarfSurf(phi, y, u, fit, cosPhi, sagBase, envFn) {
+  const e = envFn ? envFn(y) : envAt(y);
+  const R = Math.max(6, e.half * fit + 1.6);
+  const k = 0.20 - 0.08 * u;                 // 相机略俯视：底部 0.2 → 顶部 0.12
+  const sag = sagBase * Math.pow(Math.max(0, cosPhi), 1.6);
+  const wob = 0.8 * Math.sin(u * 12.4 + 1.9) + 0.35 * Math.sin(u * 29.0 + 0.4);
+  let x = e.cx + R * Math.sin(phi);
+  const ys = y + R * Math.cos(phi) * k + sag + wob * Math.sin(phi * 0.6 + 0.9);
+  if (cosPhi > 0) {
+    const lim = e.half * 0.99 + 2;
+    if (Math.abs(x - e.cx) > lim) x = e.cx + Math.sign(x - e.cx) * lim;
   }
-  if (half === 1e9) {
-    const f = clamp((y - G.top) / G.Ht, 0, 1);
-    half = envHalf(f) * 0.62;
-  }
-  return { cx: G.cx, half: Math.max(8, half * 0.97) };
+  return { x: x, y: ys, cos: cosPhi, cx: e.cx, half: e.half, R: R };
 }
 
-function scarfPoint(ring, angDeg) {
-  const th = angDeg * Math.PI / 180;
-  const u = (angDeg - scarfGeo.A0) / scarfGeo.SPAN;
-  const yBase = ring.yc + ring.climb * (u - 0.5);
-  const env = envAt(yBase);
-  // 两端向树身内收，让端头藏进枝叶，而不是飘在轮廓外
-  const radial = 1 - 0.06 * ribbonSmooth(50, 80, Math.abs(angDeg));
-  const R = Math.max(10, env.half * ring.fit * radial - 1.5);
-  let x = env.cx + R * Math.sin(th);
-  const lim = env.half * 0.99;
-  if (Math.abs(x - env.cx) > lim) x = env.cx + Math.sign(x - env.cx) * lim;
-  const sag = ring.sagBase * Math.pow(Math.max(0, Math.cos(th)), 1.6);
-  const wob = Math.sin(yBase * 0.9 + ring.k * 2.1) * SC.wobble;
-  const y = yBase + R * ring.kp * Math.cos(th) * 0.6 + sag + wob;
-  let w = ring.wNom * (1 + 0.02 * Math.sin(angDeg * 0.11 + ring.k * 1.7));
-  if (w < ring.wNom * (SC.twist ? 0.82 : 0.82)) w = ring.wNom;
-  // 扭折：每圈 +10°~+25° 之间收窄到 60%
-  if (SC.twist) {
-    const t0 = 10, t1 = 10 + SC.twistMaxDeg;
-    if (angDeg > t0 && angDeg < t1) {
-      const p = (angDeg - t0) / (t1 - t0);
-      const k2 = Math.sin(p * Math.PI);
-      w = ring.wNom * (1 - (1 - SC.twistMin) * k2);
+function scarfBuildGeo() {
+  const { top, Ht } = G;
+  const yBotC = top + Ht * 0.900;
+  const yTopC = top + Ht * 0.058;
+  const turns = SC.scarfTurns;
+  const totalAng = turns * TAU;
+  const step = SC.scarfSectionDeg * Math.PI / 180;
+  const n = Math.round(totalAng / step);
+  const phi0 = 80 * Math.PI / 180;
+
+  // 更平滑的围巾专用轮廓（±20px 滑动平均），避免带边缘跟着针叶抖动
+  const envPts = [];
+  for (let y = G.top - 20; y <= G.yBot + 20; y += 4) {
+    const e = envAt(y);
+    envPts.push({ y: y, half: e.half, cx: e.cx });
+  }
+  const envSm = [];
+  for (let i = 0; i < envPts.length; i++) {
+    let a = 0, b = 0, n = 0;
+    for (let k = -5; k <= 5; k++) {
+      const q = envPts[i + k];
+      if (!q) continue;
+      a += q.half; b += q.cx; n++;
+    }
+    envSm.push({ y: envPts[i].y, half: a / n, cx: b / n });
+  }
+  const envFn = function (y) {
+    if (y <= envSm[0].y) return envSm[0];
+    const last = envSm[envSm.length - 1];
+    if (y >= last.y) return last;
+    for (let i = 0; i < envSm.length - 1; i++) {
+      const a = envSm[i], b = envSm[i + 1];
+      if (y >= a.y && y <= b.y) {
+        const k = (y - a.y) / (b.y - a.y);
+        return { half: a.half + (b.half - a.half) * k, cx: a.cx + (b.cx - a.cx) * k };
+      }
+    }
+    return last;
+  };
+
+  const rings = [];
+  for (let r = 0; r < turns; r++) {
+    rings.push({ idx: r, len: 0, texLen: 0, texH: 0, wNom: SC.scarfWidthBottom + (SC.scarfWidthTop - SC.scarfWidthBottom) * ((r + 0.5) / turns) });
+  }
+
+  const secs = [];
+  for (let i = 0; i <= n; i++) {
+    const u = i / n;
+    const phi = phi0 + totalAng * u;
+    const rBot = Math.min(turns - 1, Math.floor(u * turns));
+    const fit = SC.scarfFit[Math.max(0, turns - 1 - rBot)];
+    const wNom = SC.scarfWidthBottom + (SC.scarfWidthTop - SC.scarfWidthBottom) * u;
+    const w = wNom * (1 + 0.02 * Math.sin(phi * 2.0 + 0.6));
+    const cosPhi = Math.cos(phi);
+    const sagBase = SC.scarfSagPx[0] + (SC.scarfSagPx[1] - SC.scarfSagPx[0]) * (1 - u);
+    const yC = yBotC + (yTopC - yBotC) * u;
+    const pT = scarfSurf(phi, yC - w * 0.5, u, fit, cosPhi, sagBase, envFn);
+    const pB = scarfSurf(phi, yC + w * 0.5, u, fit, cosPhi, sagBase, envFn);
+    secs.push({ u: u, phi: phi, cos: cosPhi, w: w, ring: rBot, uLocal: u * turns - rBot, pT: pT, pB: pB });
+  }
+
+  for (let i = 0; i < n; i++) {
+    const a = secs[i], b = secs[i + 1];
+    rings[a.ring].len += Math.hypot((b.pT.x + b.pB.x - a.pT.x - a.pB.x) * 0.5, (b.pT.y + b.pB.y - a.pT.y - a.pB.y) * 0.5);
+  }
+
+  const density = 1;
+  let totalPx = 0;
+  for (const r of rings) {
+    r.len = Math.max(40, r.len);
+    r.texLen = Math.max(64, Math.round(r.len * density));
+    r.texH = Math.max(24, Math.round((r.wNom + 7) * density));
+    totalPx += r.texLen * r.texH;
+  }
+  if (totalPx > 1500000) {
+    const f = Math.sqrt(1500000 / totalPx);
+    for (const r of rings) {
+      r.texLen = Math.max(64, Math.round(r.texLen * f));
+      r.texH = Math.max(24, Math.round(r.texH * f));
     }
   }
-  return { a: angDeg, x, y, w, R, cos: Math.cos(th), sin: Math.sin(th) };
-}
 
-function scarfThemeColors(theme) {
-  const main = theme.ribbon[0];
-  return {
-    main,
-    light: theme.ribbonLight || mix(main, theme.ribbon[1], 0.85),
-    dark: theme.ribbonDark || shade(main, -0.35),
-    stripe: theme.ribbonStripe || '#f5ead6',
-    stripe2: theme.ribbonStripe2 || theme.ornaments[1],
-    snow: theme.snowTint || theme.snowA || '#ffffff'
+  const front = [], back = [];
+  for (let i = 0; i < n; i++) {
+    const a = secs[i], b = secs[i + 1];
+    const c = (a.cos + b.cos) * 0.5;
+    const ring = rings[a.ring];
+    const midX = (a.pT.x + a.pB.x + b.pT.x + b.pB.x) * 0.25;
+    const midY = (a.pT.y + a.pB.y + b.pT.y + b.pB.y) * 0.25;
+    const e = envAt(midY);
+    const tx = (midX - e.cx) / Math.max(24, e.half);
+    const slice = {
+      si: i, ring: a.ring, sx0: a.uLocal * ring.texLen, sx1: b.uLocal * ring.texLen,
+      t0: a.pT, b0: a.pB, t1: b.pT, b1: b.pB,
+      light: clamp(1.06 - 0.34 * tx * tx - 0.10 * tx, 0.55, 1.15),
+      cos: c,
+      alpha: clamp((c - 0.04) / 0.26, 0, 1)
+    };
+    (c > -0.08 ? front : back).push(slice);
+  }
+
+  // 尾巴：接最下圈起点
+  const f0 = secs[0];
+  const ax = (f0.pT.x + f0.pB.x) * 0.5;
+  const ay = (f0.pT.y + f0.pB.y) * 0.5;
+  const tailW = SC.scarfWidthBottom * 0.85;
+  const wantLen = SC.scarfTailLength[1];
+  const tailLen = Math.min(wantLen, Math.max(48, G.yBot - ay + 6));
+  const tail = { x: ax, y: ay - 15, w: tailW, len: tailLen, phase: 1.7 };
+  const tailBox = { x: ax - tailW * 1.1 - 14, y: ay - 34, w: tailW * 2.2 + 28, h: tailLen + 56 };
+
+  // 压边针叶：绑到网格片
+  const nr = mulberry32(CONFIG.seed + 4242);
+  const needles = [];
+  const maxN = Math.min(SC.scarfNeedlesMax, front.length);
+  for (let k = 0; k < maxN; k++) {
+    const si = Math.floor(nr() * front.length);
+    const s = front[si];
+    if (!s) continue;
+    const edgeTop = nr() < 0.62;
+    const edge = edgeTop ? s.t0 : s.b0;
+    const tgx = (s.t1.x - s.t0.x), tgy = (s.t1.y - s.t0.y);
+    const tl = Math.hypot(tgx, tgy) || 1;
+    let nx = -tgy / tl, ny = tgx / tl;
+    if (!edgeTop) { nx = -nx; ny = -ny; }
+    if (ny < 0 && nr() < 0.7) { ny = -ny; }
+    const len = 4 + nr() * 7;
+    const jitter = (nr() - 0.5) * 4;
+    needles.push({
+      x: edge.x + tgx * 0.5 + nx * 1.2 + jitter,
+      y: edge.y + tgy * 0.5 + ny * 1.2,
+      x2: edge.x + tgx * 0.5 + nx * (1.2 + len) + jitter,
+      y2: edge.y + tgy * 0.5 + ny * (1.2 + len),
+      w: 1.5 + nr() * 2.0,
+      c: Math.floor(nr() * 3),
+      si: si
+    });
+  }
+
+  scarfState.geo = {
+    rings: rings, front: front, back: back, needles: needles,
+    tail: tail, tailBox: tailBox, n: n, phi0: phi0, env: envSm,
+    atlasPx: rings.reduce(function (s, r) { return s + r.texLen * r.texH; }, 0)
   };
 }
 
-// 图集：4 圈正面 + 反面 + 侧面，一行一圈
-function buildScarfAtlas(theme) {
-  const cols = Math.round((scarfGeo.SPAN || 176) / SC.atlasStepDeg) + 1;
-  const rowH = 72, faceTop = 8, faceH = 56;
+/* ---------- 针织贴图 ---------- */
+function scarfKnit(c, ring, base, light, dark, x0, x1, rowPx, colW, seed) {
+  const rr = mulberry32(seed || 1);
+  c.save();
+  c.lineCap = 'round';
+  for (let x = x0 - rowPx; x < x1; x += rowPx) {
+    for (let ci = 0; ci < SC.scarfStitchCols; ci++) {
+      const yc = (ci + 0.5) * colW;
+      const j = (rr() - 0.5) * 0.08;
+      const cw = Math.max(1.2, colW * 0.34);
+      c.lineWidth = cw;
+      c.strokeStyle = mix(base, light, clamp(0.50 + j * 1.6, 0, 0.92));
+      c.beginPath();
+      c.moveTo(x + rowPx * 0.10, yc - colW * 0.36);
+      c.quadraticCurveTo(x + rowPx * 0.60, yc - colW * 0.10, x + rowPx * 0.93, yc);
+      c.stroke();
+      c.strokeStyle = mix(base, dark, clamp(0.46 + j * 1.6, 0, 0.9));
+      c.beginPath();
+      c.moveTo(x + rowPx * 0.12, yc + colW * 0.36);
+      c.quadraticCurveTo(x + rowPx * 0.62, yc + colW * 0.10, x + rowPx * 0.93, yc);
+      c.stroke();
+      c.globalAlpha = 0.5;
+      c.lineWidth = Math.max(0.6, colW * 0.06);
+      c.strokeStyle = light;
+      c.beginPath();
+      c.moveTo(x + rowPx * 0.14, yc - colW * 0.39);
+      c.quadraticCurveTo(x + rowPx * 0.62, yc - colW * 0.14, x + rowPx * 0.93, yc - colW * 0.02);
+      c.stroke();
+      c.globalAlpha = 1;
+    }
+    c.fillStyle = 'rgba(0,0,0,0.10)';
+    c.fillRect(x + rowPx * 0.90, 0, Math.max(0.7, rowPx * 0.05), ring.texH);
+  }
+  c.restore();
+}
+function scarfBakeRingTexture(theme, ring) {
   const cv = document.createElement('canvas');
-  cv.width = cols;
-  cv.height = rowH * 6;
+  cv.width = ring.texLen;
+  cv.height = ring.texH;
   const c = cv.getContext('2d');
-  const col = scarfThemeColors(theme);
-  const degToCol = 1 / SC.atlasStepDeg;
+  const main = theme.ribbon[0];
+  const light = theme.ribbonLight || theme.ribbon[1] || mix(main, '#ffffff', 0.4);
+  const dark = theme.ribbonDark || shade(main, -0.35);
+  const cream = theme.ribbonStripe || '#f4ead0';
+  const s2 = theme.ribbonStripe2 || theme.ornaments[1];
 
-  const rows = [];
-  for (let k = 0; k < 4; k++) rows.push(k);
-  const specs = [
-    { y: rowH * 0, ring: 0 },
-    { y: rowH * 1, ring: 1 },
-    { y: rowH * 2, ring: 2 },
-    { y: rowH * 3, ring: 3 }
-  ];
+  c.fillStyle = main;
+  c.fillRect(0, 0, cv.width, cv.height);
+  const rowPx = SC.scarfStitchRowPx * 1.6;
+  const colW = cv.height / SC.scarfStitchCols;
+  scarfKnit(c, ring, main, light, dark, 0, cv.width, rowPx, colW, CONFIG.seed + ring.idx * 977);
 
-  const paintRow = (y0, baseCol, lightCol, darkCol, ringIdx, back) => {
-    // 底色 + 截面明暗
-    const g = c.createLinearGradient(0, y0 + faceTop, 0, y0 + faceTop + faceH);
-    g.addColorStop(0, mix(baseCol, '#ffffff', 0.20));
-    g.addColorStop(0.1, mix(baseCol, lightCol, 0.35));
-    g.addColorStop(0.55, baseCol);
-    g.addColorStop(0.9, mix(baseCol, darkCol, 0.55));
-    g.addColorStop(1, mix(baseCol, darkCol, 0.75));
-    c.fillStyle = g;
-    c.fillRect(0, y0 + faceTop, cols, faceH);
-
-    const ringW = scarfGeo.rings[ringIdx].wNom;
-    const R = 440;
-    const pxPerCol = Math.max(0.3, R * SC.atlasStepDeg * Math.PI / 180);
-
-    // 横向罗纹
-    const pitch = Math.max(1.2, SC.ribPitch / pxPerCol);
-    for (let x = 0; x < cols; x += pitch) {
-      c.globalAlpha = back ? 0.22 : 0.30;
-      c.fillStyle = darkCol;
-      c.fillRect(x, y0 + faceTop + 1, Math.max(0.8, 0.7 / pxPerCol), faceH - 2);
-      c.globalAlpha = back ? 0.16 : 0.22;
-      c.fillStyle = lightCol;
-      c.fillRect(x + Math.max(0.8, 0.7 / pxPerCol), y0 + faceTop + 1, Math.max(0.6, 0.55 / pxPerCol), faceH - 2);
-    }
-
-    // V 形针脚
-    const vLen = ringW * 0.26;
-    for (let x = 0; x < cols; x += pitch * 2) {
-      c.globalAlpha = 0.18;
-      c.strokeStyle = lightCol;
-      c.lineWidth = Math.max(0.8, 1 / pxPerCol);
-      c.beginPath();
-      c.moveTo(x - vLen * 0.42, y0 + faceTop + faceH * 0.5 - vLen * 0.56);
-      c.lineTo(x + vLen * 0.42, y0 + faceTop + faceH * 0.5);
-      c.lineTo(x - vLen * 0.42, y0 + faceTop + faceH * 0.5 + vLen * 0.56);
-      c.stroke();
-    }
-
-    // 条纹：−35° / +30°，宽条 + 窄条 + 宽条
-    if (!back) {
-      for (const sc of [-35, 30]) {
-        const xc = ((sc - scarfGeo.A0) / scarfGeo.SPAN) * cols;
-        const segs = [[7, col.stripe], [2.5, null], [3, col.stripe2], [2.5, null], [7, col.stripe]];
-        let off = -11;
-        for (const [pw, cc] of segs) {
-          if (cc) {
-            c.globalAlpha = 0.92;
-            c.fillStyle = cc;
-            c.fillRect(xc + off / pxPerCol, y0 + faceTop, pw / pxPerCol, faceH);
-          }
-          off += pw;
-        }
+  // 条纹：每圈 2 组，织进针脚纹理
+  const groups = [250, 305].slice(0, SC.scarfStripeGroups);
+  for (const deg of groups) {
+    const segs = [
+      { w: 10, col: cream },
+      { w: 5, col: null },
+      { w: 4, col: s2 },
+      { w: 5, col: null },
+      { w: 10, col: cream }
+    ];
+    let x = (deg / 360) * cv.width - 17;
+    for (const sg of segs) {
+      if (sg.col) {
+        c.save();
+        c.beginPath();
+        c.rect(x, 0, sg.w, cv.height);
+        c.clip();
+        c.fillStyle = sg.col;
+        c.fillRect(x, 0, sg.w, cv.height);
+        scarfKnit(c, ring, sg.col, mix(sg.col, '#ffffff', 0.5), shade(sg.col, -0.34),
+          x - rowPx, x + sg.w + rowPx, rowPx, colW, CONFIG.seed + ring.idx * 131 + Math.round(deg));
+        c.restore();
+        c.strokeStyle = 'rgba(0,0,0,0.10)';
+        c.lineWidth = 1;
+        c.strokeRect(x + 0.5, 0.5, sg.w - 1, cv.height - 1);
       }
-      // 通长细条纹：下边内 3px
-      c.globalAlpha = 0.7;
-      c.fillStyle = col.stripe2;
-      c.fillRect(0, y0 + faceTop + faceH - 3, cols, 1);
+      x += sg.w;
     }
+  }
 
-    // 缝线：上下边内 3px 虚线
-    c.globalAlpha = 0.45;
-    c.strokeStyle = lightCol;
-    c.lineWidth = 0.8;
-    const period = (SC.stitchLen + SC.stitchGap) / pxPerCol;
-    for (let x = 0; x < cols; x += period) {
-      c.beginPath();
-      c.moveTo(x, y0 + faceTop + 3);
-      c.lineTo(x + SC.stitchLen / pxPerCol, y0 + faceTop + 3);
-      c.stroke();
-      c.beginPath();
-      c.moveTo(x, y0 + faceTop + faceH - 3);
-      c.lineTo(x + SC.stitchLen / pxPerCol, y0 + faceTop + faceH - 3);
-      c.stroke();
-    }
+  // 卷边：上亮下暗
+  const gTop = c.createLinearGradient(0, 0, 0, 7);
+  gTop.addColorStop(0, hexA(light, 0.72));
+  gTop.addColorStop(0.45, hexA(light, 0.26));
+  gTop.addColorStop(1, hexA(light, 0));
+  c.fillStyle = gTop;
+  c.fillRect(0, 0, cv.width, 7);
+  const gBot = c.createLinearGradient(0, cv.height - 9, 0, cv.height);
+  gBot.addColorStop(0, hexA(dark, 0));
+  gBot.addColorStop(0.6, hexA(dark, 0.42));
+  gBot.addColorStop(1, hexA(dark, 0.78));
+  c.fillStyle = gBot;
+  c.fillRect(0, cv.height - 9, cv.width, 9);
 
-    // 纱线噪点
-    let nrng = mulberry32(3311 + ringIdx * 17);
-    for (let i = 0; i < cols * 2; i++) {
-      const x = nrng() * cols, y = y0 + faceTop + nrng() * faceH;
-      c.globalAlpha = 0.12;
-      c.fillStyle = i % 2 ? lightCol : darkCol;
-      c.fillRect(x, y, 0.6, 0.6);
-    }
+  // 体积感：圆管式横向明暗（上沿受光、中段过渡、下沿压暗）
+  const gTone = c.createLinearGradient(0, 0, 0, cv.height);
+  gTone.addColorStop(0, hexA(light, 0.78));
+  gTone.addColorStop(0.10, hexA(light, 0.40));
+  gTone.addColorStop(0.24, hexA(light, 0.02));
+  gTone.addColorStop(0.42, hexA('#000000', 0.10));
+  gTone.addColorStop(0.66, hexA('#000000', 0.26));
+  gTone.addColorStop(0.86, hexA(dark, 0.44));
+  gTone.addColorStop(1, hexA(dark, 0.80));
+  c.fillStyle = gTone;
+  c.fillRect(0, 0, cv.width, cv.height);
 
-    // 外延区：毛边 + 描边 + 积雪
-    c.globalAlpha = 0.35;
-    c.strokeStyle = mix(lightCol, '#ffffff', 0.3);
-    c.lineWidth = 1;
+  // 一道柔和高光带（湿毛线的反光），位置偏上
+  const gHi = c.createLinearGradient(0, cv.height * 0.12, 0, cv.height * 0.34);
+  gHi.addColorStop(0, hexA(light, 0));
+  gHi.addColorStop(0.5, hexA(light, 0.22));
+  gHi.addColorStop(1, hexA(light, 0));
+  c.fillStyle = gHi;
+  c.fillRect(0, cv.height * 0.12, cv.width, cv.height * 0.22);
+
+  // 不规则斜向褶皱，打散“平涂/传送带”感
+  const cr = mulberry32(CONFIG.seed + ring.idx * 613 + 11);
+  for (let i = 0; i < Math.floor(cv.width / 90); i++) {
+    const x = cr() * cv.width;
+    const wd = 10 + cr() * 26;
+    c.globalAlpha = 0.06 + cr() * 0.05;
+    c.fillStyle = cr() < 0.5 ? '#ffffff' : '#000000';
     c.beginPath();
-    c.moveTo(0, y0 + faceTop); c.lineTo(cols, y0 + faceTop);
-    c.moveTo(0, y0 + faceTop + faceH); c.lineTo(cols, y0 + faceTop + faceH);
-    c.stroke();
+    c.moveTo(x, 0);
+    c.lineTo(x + wd, 0);
+    c.lineTo(x + wd * 0.7 + cv.height * 0.18, cv.height);
+    c.lineTo(x + cv.height * 0.18, cv.height);
+    c.closePath();
+    c.fill();
+  }
+  c.globalAlpha = 1;
 
-    if (!back) {
-      let frng = mulberry32(1144 + ringIdx * 7);
-      for (let x = 0; x < cols; x += Math.max(1, 2.2 / pxPerCol)) {
-        if (frng() < 0.35) continue;
-        c.globalAlpha = 0.3 + frng() * 0.2;
-        c.strokeStyle = lightCol;
-        c.lineWidth = 0.6;
-        const len = 1 + frng() * 1.4;
-        c.beginPath();
-        c.moveTo(x, y0 + faceTop);
-        c.lineTo(x + (frng() - 0.5) * 1.2, y0 + faceTop - len);
-        c.stroke();
-        if (frng() > 0.5) {
-          c.beginPath();
-          c.moveTo(x, y0 + faceTop + faceH);
-          c.lineTo(x + (frng() - 0.5) * 1.2, y0 + faceTop + faceH + len);
-          c.stroke();
-        }
-      }
-      // 积雪帽（越往上越少，避开条纹）
-      const caps = ringIdx >= 3 ? 3 : 5;
-      let srng = mulberry32(7788 + ringIdx * 11);
-      for (let i = 0; i < caps; i++) {
-        const x = srng() * cols;
-        const ang = scarfGeo.A0 + (x / cols) * scarfGeo.SPAN;
-        const nearStripe = Math.abs(ang + 35) < 8 || Math.abs(ang - 30) < 8;
-        if (nearStripe) continue;
-        const rx = (8 + srng() * 12) / pxPerCol;
-        c.globalAlpha = 0.86;
-        c.fillStyle = '#ffffff';
-        c.beginPath();
-        c.ellipse(x, y0 + faceTop - 1, rx, 1.6, 0, 0, TAU);
-        c.fill();
-      }
+  // 边缘描线：上亮下暗
+  const gEdgeT = c.createLinearGradient(0, 0, 0, 7);
+  gEdgeT.addColorStop(0, hexA(light, 0.55));
+  gEdgeT.addColorStop(0.55, hexA(light, 0.16));
+  gEdgeT.addColorStop(1, hexA(light, 0));
+  c.fillStyle = gEdgeT;
+  c.fillRect(0, 0, cv.width, 7);
+  const gEdgeB = c.createLinearGradient(0, cv.height - 13, 0, cv.height);
+  gEdgeB.addColorStop(0, hexA(dark, 0));
+  gEdgeB.addColorStop(0.55, hexA(dark, 0.26));
+  gEdgeB.addColorStop(1, hexA(dark, 0.62));
+  c.fillStyle = gEdgeB;
+  c.fillRect(0, cv.height - 13, cv.width, 13);
+
+  // 毛料噪点：打破平涂感
+  const nz = mulberry32(CONFIG.seed + ring.idx * 719 + 3);
+  const nDots = Math.round(cv.width * cv.height / 70);
+  for (let i = 0; i < nDots; i++) {
+    const x = nz() * cv.width, y = nz() * cv.height;
+    c.globalAlpha = 0.03 + nz() * 0.05;
+    c.fillStyle = nz() < 0.55 ? '#ffffff' : '#000000';
+    c.fillRect(x, y, 1 + (nz() < 0.3 ? 1 : 0), 1);
+  }
+  c.globalAlpha = 1;
+
+  // 毛边
+  if (SC.scarfFuzz) {
+    const fr = mulberry32(CONFIG.seed + ring.idx * 331 + 7);
+    const nHair = Math.floor(cv.width * 0.28);
+    c.lineCap = 'round';
+    for (let i = 0; i < nHair; i++) {
+      const x = fr() * cv.width;
+      const top = fr() < 0.62;
+      const y = top ? 3.2 : cv.height - 3.2;
+      const len = 1.4 + fr() * 2.4;
+      c.globalAlpha = 0.16 + fr() * 0.12;
+      c.strokeStyle = top ? light : dark;
+      c.lineWidth = 0.7 + fr() * 0.6;
+      c.beginPath();
+      c.moveTo(x, y);
+      c.lineTo(x + (fr() - 0.5) * 2.4, top ? y - len : y + len);
+      c.stroke();
     }
     c.globalAlpha = 1;
-  };
-
-  paintRow(rowH * 0, col.main, col.light, col.dark, 0, false);
-  paintRow(rowH * 1, col.main, col.light, col.dark, 1, false);
-  paintRow(rowH * 2, col.main, col.light, col.dark, 2, false);
-  paintRow(rowH * 3, col.main, col.light, col.dark, 3, false);
-  // 反面行
-  paintRow(rowH * 4, mix(col.dark, col.main, 0.4), col.light, col.dark, 0, true);
-  // 侧面行
-  c.fillStyle = col.dark;
-  c.fillRect(0, rowH * 5, cols, rowH);
-  c.globalAlpha = 0.35;
-  c.fillStyle = mix(col.dark, '#000000', 0.3);
-  c.fillRect(0, rowH * 5 + rowH * 0.7, cols, 2);
-
+  }
+  cv.m = 3;
   return cv;
 }
 
-function createScarfItem(themeIdx) {
-  const theme = THEMES[themeIdx];
-  const atlas = buildScarfAtlas(theme);
-  const cv = document.createElement('canvas');
-  cv.width = Math.max(1, Math.round(W * scale * dpr));
-  cv.height = Math.max(1, Math.round(H * scale * dpr));
-  const c2 = cv.getContext('2d');
-  c2.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-
-  const sh = document.createElement('canvas');
-  sh.width = cv.width; sh.height = cv.height;
-  const sctx = sh.getContext('2d');
-  sctx.setTransform(scale * dpr, 0, 0, scale * dpr, 0, 0);
-
-  const item = {
-    idx: themeIdx, theme, atlas, cv, ctx: c2, shadow: sh, shadowCtx: sctx,
-    upto: [0, 0, 0, 0], tailDrawn: false, knotDrawn: false, ready: true
-  };
-  scarfItems.set(themeIdx, item);
-  return item;
+/* ---------- 贴图映射 ---------- */
+function scarfTexQuad(ctx, k, s, atl) {
+  const dsw = Math.max(0.8, s.sx1 - s.sx0);
+  const tx = (s.t1.x - s.t0.x + s.b1.x - s.b0.x) * 0.5;
+  const ty = (s.t1.y - s.t0.y + s.b1.y - s.b0.y) * 0.5;
+  const vx = (s.b0.x - s.t0.x + s.b1.x - s.t1.x) * 0.5;
+  const vy = (s.b0.y - s.t0.y + s.b1.y - s.t1.y) * 0.5;
+  const h = atl.height;
+  const M = atl.m || 0;
+  const hh = Math.max(4, h - M * 2);
+  ctx.globalAlpha = s.alpha == null ? 1 : s.alpha;
+  const sU = (dsw + 0.9) / dsw, sV = (hh + 1.2) / hh;
+  const ox = s.t0.x - tx * 0.45 / dsw - vx * (M + 0.6) / hh;
+  const oy = s.t0.y - ty * 0.45 / dsw - vy * (M + 0.6) / hh;
+  ctx.setTransform(k * tx * sU / dsw, k * ty * sU / dsw, k * vx * sV / hh, k * vy * sV / hh, k * ox, k * oy);
+  ctx.drawImage(atl, s.sx0, 0, dsw, h, 0, 0, dsw, h);
+  ctx.globalAlpha = 1;
 }
 
-function drawScarfSlices(item, k, upto, alphaMul) {
-  const ring = scarfGeo.rings[k];
-  const pts = ring.pts;
-  const c = item.ctx;
-  const cols = item.atlas.width;
-  const colSpan = 188 / SC.atlasStepDeg;
-  const rowY = k * 72;
-  const start = item.upto[k];
-  if (upto <= start) return;
-  for (let i = start; i < upto && i < pts.length - 1; i++) {
-    const a = pts[i], b = pts[i + 1];
-    const x0 = a.x, x1 = b.x;
-    const yT0 = a.y - a.w * 0.5 - 8;
-    const yT1 = b.y - b.w * 0.5 - 8;
-    const hgt = ((a.w + b.w) * 0.5) + 16;
-    let alpha = 1;
-    const edge = Math.max(Math.abs(a.a), Math.abs(b.a));
-    if (edge > 70) alpha = ribbonSmooth(80, 70, edge);
-    if (alpha <= 0.01) continue;
-
-    const sx = ((a.a - scarfGeo.A0) / scarfGeo.SPAN) * cols;
-    const sw = Math.max(1, ((b.a - a.a) / scarfGeo.SPAN) * cols + 1);
-    c.save();
-    c.globalAlpha = alpha * alphaMul;
-    c.setTransform((x1 - x0) * (scale * dpr), (yT1 - yT0) * (scale * dpr), 0, hgt * (scale * dpr),
-                   x0 * (scale * dpr), yT0 * (scale * dpr));
-    c.drawImage(item.atlas, sx, rowY, sw, 72, 0, 0, 1, 1);
-    c.restore();
-  }
-  // 投影：整圈用不透明色块，偏移后叠一层
-  const sc = item.shadowCtx;
-  sc.save();
-  sc.fillStyle = mix(item.theme.treeShadow || '#000000', '#000000', 0.3);
-  for (let i = start; i < upto && i < pts.length - 1; i++) {
-    const a = pts[i], b = pts[i + 1];
-    sc.beginPath();
-    sc.moveTo(a.x + SC.shadowOffset[0], a.y - a.w * 0.5 + SC.shadowOffset[1]);
-    sc.lineTo(b.x + SC.shadowOffset[0], b.y - b.w * 0.5 + SC.shadowOffset[1]);
-    sc.lineTo(b.x + SC.shadowOffset[0], b.y + b.w * 0.5 + SC.shadowOffset[1]);
-    sc.lineTo(a.x + SC.shadowOffset[0], a.y + a.w * 0.5 + SC.shadowOffset[1]);
-    sc.closePath();
-    sc.fill();
-  }
-  sc.restore();
-  item.upto[k] = Math.min(upto, pts.length - 1);
+function scarfLightChunk(ctx, k, arr, from, to) {
+  let sum = 0;
+  for (let i = from; i < to; i++) sum += arr[i].light;
+  const L = sum / Math.max(1, to - from);
+  if (L > 0.995 && L < 1.005) return;
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.fillStyle = L > 1 ? 'rgba(255,255,255,' + ((L - 1) * 0.55).toFixed(3) + ')'
+                        : 'rgba(0,0,0,' + ((1 - L) * 0.42).toFixed(3) + ')';
+  ctx.beginPath();
+  const a = arr[from];
+  ctx.moveTo(a.t0.x, a.t0.y);
+  for (let i = from; i < to; i++) ctx.lineTo(arr[i].t1.x, arr[i].t1.y);
+  for (let i = to - 1; i >= from; i--) ctx.lineTo(arr[i].b1.x, arr[i].b1.y);
+  ctx.lineTo(a.b0.x, a.b0.y);
+  ctx.closePath();
+  ctx.fill();
 }
 
-function drawScarfTail(item) {
-  const c = item.ctx;
-  const ring = scarfGeo.rings[0];
-  // 接点：第 0 圈 θ=+72°
-  const idx = Math.round((72 - scarfGeo.A0) / SC.sliceDeg);
-  const a = ring.pts[Math.min(idx, ring.pts.length - 1)];
-  const env = scarfEnv(a.y);
-  const w0 = a.w * 0.85;
-  const x0 = Math.min(a.x, env.cx + env.half - w0 * 0.5 - 3);
-  const y0 = a.y + a.w * 0.5 - 2;
-  const len = Math.min(SC.tailLen[1], Math.max(SC.tailLen[0], G.yBot - y0 - 10));
-  const col = scarfThemeColors(item.theme);
-  const pts = [];
-  for (let j = 0; j <= 20; j++) {
-    const u = j / 20;
-    const sy = y0 + len * u;
-    const e = envAt(sy);
-    const x = Math.min(e.cx + e.half - w0 * 0.5 - 2, x0 - 2 * u);
-    pts.push({ x, y: sy, w: w0 * (1 - 0.05 * u) });
-  }
-  c.save();
-  c.lineCap = 'round'; c.lineJoin = 'round';
-  // 折叠重叠面，盖住接缝
-  c.globalAlpha = 1;
-  c.fillStyle = mix(col.main, col.dark, 0.25);
-  c.beginPath();
-  c.moveTo(x0 - w0 * 0.55, y0 - 6);
-  c.lineTo(x0 + w0 * 0.55, y0 - 6);
-  c.lineTo(x0 + w0 * 0.5, y0 + 2);
-  c.lineTo(x0 - w0 * 0.5, y0 + 2);
-  c.closePath(); c.fill();
-  // 尾巴布面
-  c.fillStyle = col.main;
-  c.beginPath();
-  for (let j = 0; j < pts.length; j++) {
-    const q = pts[j];
-    if (j === 0) c.moveTo(q.x - q.w * 0.5, q.y); else c.lineTo(q.x - q.w * 0.5, q.y);
-  }
-  const e = pts[pts.length - 1];
-  c.lineTo(e.x + e.w * 0.42, e.y + 8);
-  c.lineTo(e.x + e.w * 0.5, e.y);
-  for (let j = pts.length - 1; j >= 0; j--) {
-    const q = pts[j];
-    c.lineTo(q.x + q.w * 0.5, q.y);
-  }
-  c.closePath(); c.fill();
-  // 条纹与锁边
-  for (const dy of [10, 20]) {
-    const yy = e.y - dy;
-    c.globalAlpha = 0.8;
-    c.strokeStyle = dy === 10 ? col.stripe : col.stripe2;
-    c.lineWidth = dy === 10 ? 2.6 : 1.8;
-    c.beginPath(); c.moveTo(e.x - e.w * 0.5 + 1, yy); c.lineTo(e.x + e.w * 0.5 - 1, yy); c.stroke();
-  }
-  c.globalAlpha = 0.5;
-  c.strokeStyle = col.light;
-  c.lineWidth = 0.9;
-  c.setLineDash([2.4, 1.8]);
-  c.beginPath(); c.moveTo(e.x - e.w * 0.5, e.y - 6); c.lineTo(e.x + e.w * 0.5, e.y - 6); c.stroke();
-  c.setLineDash([]);
-  // 流苏
-  for (let k = 0; k < 11; k++) {
-    const off = (-0.5 + k / 10) * e.w * 0.9;
-    c.globalAlpha = 0.8;
-    c.strokeStyle = k % 2 ? col.stripe : col.light;
-    c.lineWidth = 1;
+/* ---------- 主题资源 ---------- */
+function scarfItemFor(idx) {
+  let it = scarfState.items.get(idx);
+  if (it) return it;
+  if (!scarfState.geo) return null;
+  const t0 = performance.now();
+  const theme = THEMES[idx];
+  const front = scarfLayer(1);
+  const back = scarfLayer(1);
+  const shadow = scarfLayer(0.5);
+  // 正面层裁到树的轮廓内（略外扩 2.5px），让带面在轮廓处自然被树遮住，而不是切出尖角
+  if (scarfState.geo.env) {
+    const c = front.ctx;
+    c.setTransform(front.k, 0, 0, front.k, 0, 0);
     c.beginPath();
-    c.moveTo(e.x + off, e.y + 2);
-    c.lineTo(e.x + off + Math.sin(k * 1.3) * 1.2, e.y + 2 + 10 + (k % 4) * 1.4);
-    c.stroke();
+    const E = scarfState.geo.env, pad = 2.5;
+    c.moveTo(E[0].cx - E[0].half - pad, E[0].y);
+    for (let i = 1; i < E.length; i++) c.lineTo(E[i].cx - E[i].half - pad, E[i].y);
+    for (let i = E.length - 1; i >= 0; i--) c.lineTo(E[i].cx + E[i].half + pad, E[i].y);
+    c.closePath();
+    c.clip();
   }
-  c.restore();
-  c.globalAlpha = 1;
-  item.tailDrawn = true;
+  const atlases = [];
+  for (const ring of scarfState.geo.rings) atlases.push(scarfBakeRingTexture(theme, ring));
+  const tb = scarfState.geo.tailBox;
+  const tk = scale * dpr;
+  const tailCv = document.createElement('canvas');
+  tailCv.width = Math.max(1, Math.round(tb.w * tk));
+  tailCv.height = Math.max(1, Math.round(tb.h * tk));
+  const tailCtx = tailCv.getContext('2d');
+  tailCtx.setTransform(tk, 0, 0, tk, 0, 0);
+  it = {
+    idx: idx, theme: theme, front: front, back: back, shadow: shadow,
+    atlases: atlases, fF: 0, bB: 0, sS: 0, lc: 0,
+    tail: { cv: tailCv, ctx: tailCtx, k: tk },
+    shCol: hexA(shade(theme.treeShadow, -0.7), 0.62),
+    shSoft: hexA(shade(theme.treeShadow, -0.5), 0.30),
+    shThick: hexA(shade(theme.ribbonDark || theme.ribbon[0], -0.62), 0.62),
+    backCol: hexA(shade(theme.ribbon[0], -0.68), 0.62)
+  };
+  scarfState.items.set(idx, it);
+  scarfState.bakeMs = performance.now() - t0;
+
+  const keep = [themeState.cur, idx];
+  const tc = trans ? trans.to : -1;
+  if (tc >= 0) keep.push(tc);
+  for (const key of Array.from(scarfState.items.keys())) {
+    if (keep.indexOf(key) < 0) scarfState.items.delete(key);
+  }
+  if (SC.debugScarf) console.log('[scarf] bake theme ' + idx + ' ' + scarfState.bakeMs.toFixed(1) + 'ms');
+  return it;
 }
 
-function drawScarfKnot(item) {
-  const c = item.ctx;
-  const ring = scarfGeo.rings[3];
-  const a = ring.pts[ring.pts.length - 1];
-  const col = scarfThemeColors(item.theme);
-  const kx = a.x, ky = a.y + 2, kw = a.w * 1.35;
+/* ---------- 揭示 ---------- */
+function scarfGrowP() {
+  if (!scarfState.geo) return 0;
+  return clamp((vt - scarfState.startT) / Math.max(0.4, SC.scarfGrowSeconds), 0, 1);
+}
+
+function scarfRevealItem(it, p) {
+  const g = scarfState.geo;
+  if (!g) return;
+  const t0 = performance.now();
+  const nG = p >= 1 ? g.n : Math.floor(g.n * p);
+  let nF = 0;
+  while (nF < g.front.length && g.front[nF].si < nG) nF++;
+  if (it.fF < nF) {
+    for (let i = it.fF; i < nF; i++) {
+      const s = g.front[i];
+      scarfTexQuad(it.front.ctx, it.front.k, s, it.atlases[s.ring]);
+    }
+    it.fF = nF;
+  }
+  const CH = 10;
+  while ((it.lc + 1) * CH <= nF) {
+    scarfLightChunk(it.front.ctx, it.front.k, g.front, it.lc * CH, (it.lc + 1) * CH);
+    it.lc++;
+  }
+  const nS = nF;
+  if (it.sS < nS) {
+    for (let i = it.sS; i < nS; i++) {
+      const s = g.front[i];
+      scarfShadowQuad(it.shadow.ctx, it.shadow.k, s, it.shCol, 2.4, 8.0);
+      scarfShadowQuad(it.shadow.ctx, it.shadow.k, s, it.shSoft, 3.6, 11.0);
+      scarfShadowQuad(it.shadow.ctx, it.shadow.k, s, it.shThick, 0.7, 2.6);
+    }
+    it.sS = nS;
+  }
+  let nB = 0;
+  while (nB < g.back.length && g.back[nB].si < nG) nB++;
+  if (it.bB < nB) {
+    for (let i = it.bB; i < nB; i++) {
+      const s = g.back[i];
+      scarfTexQuad(it.back.ctx, it.back.k, s, it.atlases[s.ring]);
+      it.back.ctx.setTransform(it.back.k, 0, 0, it.back.k, 0, 0);
+      it.back.ctx.fillStyle = it.backCol;
+      it.back.ctx.beginPath();
+      it.back.ctx.moveTo(s.t0.x, s.t0.y);
+      it.back.ctx.lineTo(s.b0.x, s.b0.y);
+      it.back.ctx.lineTo(s.b1.x, s.b1.y);
+      it.back.ctx.lineTo(s.t1.x, s.t1.y);
+      it.back.ctx.closePath();
+      it.back.ctx.fill();
+    }
+    it.bB = nB;
+  }
+  scarfState.revealMs = performance.now() - t0;
+}
+
+function scarfShadowQuad(ctx, k, s, col, dx, dy) {
+  ctx.setTransform(k, 0, 0, k, 0, 0);
+  ctx.fillStyle = col;
+  ctx.beginPath();
+  ctx.moveTo(s.t0.x + dx, s.t0.y + dy);
+  ctx.lineTo(s.b0.x + dx, s.b0.y + dy);
+  ctx.lineTo(s.b1.x + dx, s.b1.y + dy);
+  ctx.lineTo(s.t1.x + dx, s.t1.y + dy);
+  ctx.closePath();
+  ctx.fill();
+}
+
+/* ---------- 尾巴 ---------- */
+function scarfDrawTail(it, alpha, grow) {
+  grow = grow == null ? 1 : grow;
+  const g = scarfState.geo;
+  if (!g) return;
+  const tb = g.tailBox;
+  const c = it.tail.ctx;
+  const k = it.tail.k;
+  c.setTransform(1, 0, 0, 1, 0, 0);
+  c.clearRect(0, 0, it.tail.cv.width, it.tail.cv.height);
+  c.setTransform(k, 0, 0, k, 0, 0);
+  c.translate(-tb.x, -tb.y);
+
+  const th = it.theme;
+  const main = th.ribbon[0];
+  const light = th.ribbonLight || th.ribbon[1];
+  const dark = th.ribbonDark || shade(main, -0.35);
+  const cream = th.ribbonStripe || '#f4ead0';
+  const s2 = th.ribbonStripe2 || th.ornaments[1];
+  const T = g.tail;
+  const swing = Math.sin(vt * 0.9 + T.phase) * 1.6 * Math.PI / 180;
+  const w = T.w, L = T.len;
+
   c.save();
-  c.fillStyle = col.main;
+  c.translate(T.x, T.y);
+  c.rotate(swing);
   c.beginPath();
-  c.ellipse(kx, ky, kw * 0.5, a.w * 0.5, 0.15, 0, TAU);
+  c.rect(-T.w * 1.4, -30, T.w * 2.8, 26 + (T.len + 26) * grow);
+  c.clip();
+
+  // 主体轮廓（略带垂坠收窄）
+  function bodyPath() {
+    c.beginPath();
+    c.moveTo(-w * 0.5, -2);
+    c.quadraticCurveTo(-w * 0.54, L * 0.42, -w * 0.43, L - 3);
+    c.lineTo(w * 0.44, L);
+    c.quadraticCurveTo(w * 0.54, L * 0.42, w * 0.5, -2);
+    c.closePath();
+  }
+
+  // 尾布落在树上的投影
+  c.save();
+  c.translate(2.6, 4.6);
+  c.globalAlpha = 0.38;
+  c.fillStyle = shade(th.treeShadow || dark, -0.55);
+  bodyPath();
   c.fill();
-  c.globalAlpha = 0.45;
-  c.strokeStyle = col.light;
-  c.lineWidth = 1;
-  for (let i = 0; i < 2; i++) {
-    c.beginPath();
-    c.ellipse(kx, ky, kw * (0.22 + i * 0.1), a.w * 0.28, 0.15, 0.2, Math.PI + 0.2);
-    c.stroke();
+  c.restore();
+
+  const gMain = c.createLinearGradient(-w * 0.5, 0, w * 0.55, 0);
+  gMain.addColorStop(0, mix(main, light, 0.42));
+  gMain.addColorStop(0.32, main);
+  gMain.addColorStop(0.78, shade(main, -0.16));
+  gMain.addColorStop(1, shade(main, -0.38));
+  bodyPath();
+  c.fillStyle = gMain;
+  c.fill();
+
+  // 针织纹理（V 针脚，不用横线）
+  c.save();
+  bodyPath();
+  c.clip();
+  const cols = 4;
+  const colW = w / cols;
+  const rowPx = 5;
+  for (let y = 1; y < L; y += rowPx) {
+    for (let i = 0; i < cols; i++) {
+      const xc = -w * 0.5 + (i + 0.5) * colW;
+      const shadeK = i === 0 ? 0.26 : (i === cols - 1 ? -0.16 : 0.04);
+      c.lineCap = 'round';
+      c.lineWidth = Math.max(1.1, colW * 0.2);
+      c.strokeStyle = shadeK > 0 ? mix(main, light, shadeK) : shade(main, shadeK);
+      c.beginPath();
+      c.moveTo(xc - colW * 0.32, y);
+      c.quadraticCurveTo(xc - colW * 0.05, y + rowPx * 0.55, xc, y + rowPx * 0.86);
+      c.stroke();
+      c.beginPath();
+      c.moveTo(xc + colW * 0.32, y);
+      c.quadraticCurveTo(xc + colW * 0.05, y + rowPx * 0.55, xc, y + rowPx * 0.86);
+      c.stroke();
+      c.globalAlpha = 0.34;
+      c.lineWidth = 0.8;
+      c.strokeStyle = mix(light, '#ffffff', 0.35);
+      c.beginPath();
+      c.moveTo(xc - colW * 0.34, y - 0.4);
+      c.quadraticCurveTo(xc - colW * 0.05, y + rowPx * 0.3, xc - 0.4, y + rowPx * 0.62);
+      c.stroke();
+      c.globalAlpha = 1;
+    }
+    c.fillStyle = 'rgba(0,0,0,0.07)';
+    c.fillRect(-w * 0.55, y + rowPx * 0.92, w * 1.1, 0.8);
   }
-  // 短尾
-  c.globalAlpha = 0.95;
-  c.fillStyle = mix(col.main, col.light, 0.1);
+
+  // 织入的条纹（两道细条）
+  for (const st of [{ y: L * 0.46, h: 4.5, col: cream }, { y: L * 0.56, h: 2.0, col: s2 }]) {
+    c.globalAlpha = 0.95;
+    c.fillStyle = st.col;
+    c.fillRect(-w * 0.55, st.y, w * 1.1, st.h);
+    c.globalAlpha = 0.25;
+    c.fillStyle = '#000';
+    c.fillRect(-w * 0.55, st.y + st.h, w * 1.1, 0.7);
+    c.globalAlpha = 1;
+  }
+
+  // 左右明暗与卷边
+  const gSide = c.createLinearGradient(-w * 0.5, 0, -w * 0.5 + 6, 0);
+  gSide.addColorStop(0, hexA(light, 0.35));
+  gSide.addColorStop(1, hexA(light, 0));
+  c.fillStyle = gSide;
+  c.fillRect(-w * 0.55, 0, 6, L + 2);
+  const gSide2 = c.createLinearGradient(w * 0.5 - 7, 0, w * 0.5, 0);
+  gSide2.addColorStop(0, hexA(dark, 0));
+  gSide2.addColorStop(1, hexA(dark, 0.5));
+  c.fillStyle = gSide2;
+  c.fillRect(w * 0.5 - 7, 0, 7, L + 2);
+
+  // 锁边缝线
+  c.setLineDash([1.6, 1.6]);
+  c.strokeStyle = hexA(light, 0.55);
+  c.lineWidth = 0.8;
+  bodyPath();
+  c.stroke();
+  c.setLineDash([]);
+  c.restore();
+
+  // 顶端折叠面（盖住接缝）
+  c.fillStyle = mix(main, light, 0.3);
   c.beginPath();
-  c.moveTo(kx - a.w * 0.3, ky + 4);
-  c.lineTo(kx + a.w * 0.25, ky + 4);
-  c.lineTo(kx - a.w * 0.05, ky + 24);
-  c.lineTo(kx - a.w * 0.3, ky + 24);
-  c.closePath(); c.fill();
-  c.globalAlpha = 0.7;
-  for (let i = 0; i < 5; i++) {
-    const off = (-0.5 + i / 4) * a.w * 0.35;
-    c.strokeStyle = i % 2 ? col.stripe : col.light;
-    c.lineWidth = 0.9;
-    c.beginPath();
-    c.moveTo(kx - a.w * 0.2 + off, ky + 24);
-    c.lineTo(kx - a.w * 0.2 + off + Math.sin(i) * 0.8, ky + 30 + (i % 3));
-    c.stroke();
+  c.moveTo(-w * 0.62, -3);
+  c.lineTo(w * 0.62, -3);
+  c.lineTo(w * 0.55, 7);
+  c.quadraticCurveTo(0, 9.5, -w * 0.56, 7);
+  c.closePath();
+  c.fill();
+  c.strokeStyle = hexA(dark, 0.55);
+  c.lineWidth = 1;
+  c.beginPath();
+  c.moveTo(-w * 0.56, 7);
+  c.quadraticCurveTo(0, 9.5, w * 0.55, 7);
+  c.stroke();
+
+  // 流苏：每束 3 根拧紧的线
+  const fringeN = SC.scarfFringeCount[0] + Math.round((SC.scarfFringeCount[1] - SC.scarfFringeCount[0]) * 0.4);
+  c.lineCap = 'round';
+  for (let i = 0; i < fringeN; i++) {
+    const fx = -w * 0.40 + (i / Math.max(1, fringeN - 1)) * w * 0.80;
+    const fl = 11 + (i % 4) * 2.0;
+    const drift = Math.sin(i * 1.7 + 0.6) * 1.8;
+    for (let q = 0; q < 3; q++) {
+      c.strokeStyle = q === 0 ? mix(main, light, 0.45) : (q === 1 ? shade(main, -0.10) : shade(main, -0.36));
+      c.lineWidth = 1.9;
+      c.beginPath();
+      c.moveTo(fx + (q - 1) * 0.9, L - 2);
+      c.quadraticCurveTo(fx + (q - 1) * 1.8 + drift, L + fl * 0.55, fx + (q - 1) * 2.6 + drift, L + fl);
+      c.stroke();
+    }
   }
   c.restore();
-  c.globalAlpha = 1;
-  item.knotDrawn = true;
+
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.drawImage(it.tail.cv, tb.x, tb.y, tb.w, tb.h);
+  ctx.restore();
 }
 
-function scarfTotalSlices() {
-  let n = 0;
-  for (const r of scarfGeo.rings) n += r.pts.length - 1;
-  return n;
-}
-
-function updateScarfItem(item, growT, alphaMul) {
-  const total = scarfTotalSlices();
-  let budget = Math.floor(growT * total);
-  for (let k = 0; k < 4; k++) {
-    const n = scarfGeo.rings[k].pts.length - 1;
-    const take = clamp(budget, 0, n);
-    drawScarfSlices(item, k, take, alphaMul);
-    budget -= n;
+/* ---------- 绘制 ---------- */
+function scarfUpdateItems() {
+  const p = scarfGrowP();
+  if (p <= 0) return 0;
+  const ids = trans ? [trans.from, trans.to] : [themeState.cur];
+  for (const id of ids) {
+    const it = scarfItemFor(id);
+    if (it) scarfRevealItem(it, p);
   }
-  if (growT >= 0.02 && !item.tailDrawn) drawScarfTail(item);
-  if (growT >= 0.985 && !item.knotDrawn) drawScarfKnot(item);
+  scarfState.lastP = p;
+  return p;
 }
 
-function drawScarfV2(themeNow) {
-  if (!scarfGeo) buildScarfGeo();
-  const p = ribbonGrow();
-  let cur = scarfItems.get(themeState.cur);
-  if (!cur) cur = createScarfItem(themeState.cur);
-
-  const main = ctx;
-  ctx.setTransform(dpr * scale, 0, 0, dpr * scale, dpr * ox, dpr * oy);
-
-  updateScarfItem(cur, p, 1);
+function scarfAlphaPair() {
   if (trans) {
-    const a = scarfItems.get(trans.from), b = scarfItems.get(trans.to);
-    if (b) updateScarfItem(b, p, 1);
-    if (a) updateScarfItem(a, p, 1);
+    const p = easeInOut(clamp((vt - trans.t0) / trans.dur, 0, 1));
+    return [{ idx: trans.from, a: 1 - p }, { idx: trans.to, a: p }];
   }
-
-  const blitItem = (item, alpha) => {
-    if (!item) return;
-    ctx.save();
-    ctx.globalAlpha = SC.shadowAlpha * alpha;
-    ctx.drawImage(item.shadow, 0, 0, W, H);
-    ctx.restore();
-    ctx.save();
-    ctx.globalAlpha = alpha;
-    ctx.drawImage(item.cv, 0, 0, W, H);
-    ctx.restore();
-  };
-
-  if (trans && scarfItems.get(trans.from) && scarfItems.get(trans.to)) {
-    const k = easeInOut(clamp((vt - trans.t0) / trans.dur, 0, 1));
-    blitItem(scarfItems.get(trans.from), 1 - k);
-    blitItem(scarfItems.get(trans.to), k);
-  } else {
-    blitItem(cur, 1);
-  }
-  ctx = main;
+  return [{ idx: themeState.cur, a: 1 }];
 }
 
-function scarfSelfCheckNew(item) {
-  try {
-    const total = scarfTotalSlices();
-    if (!total) return;
-    console.log('[scarf] rings=4 slices=' + total + ' atlas=' + item.atlas.width + 'x' + item.atlas.height);
-  } catch (e) {}
+function scarfBlit(kind) {
+  const p = scarfUpdateItems();
+  if (p <= 0) return;
+  const pairs = scarfAlphaPair();
+  for (const pr of pairs) {
+    const it = scarfState.items.get(pr.idx);
+    if (!it) continue;
+    ctx.globalAlpha = pr.a;
+    ctx.drawImage(it[kind].cv, 0, 0, W, H);
+  }
+  ctx.globalAlpha = 1;
+}
+
+function scarfDrawDynamic() {
+  const p = scarfGrowP();
+  if (p <= 0.02) return;
+  const pairs = scarfAlphaPair();
+  for (const pr of pairs) {
+    const it = scarfState.items.get(pr.idx);
+    if (it) scarfDrawTail(it, pr.a * clamp(p * 6, 0, 1), clamp((p - 0.03) / 0.20, 0, 1));
+  }
+  ctx.globalAlpha = 1;
+}
+
+function scarfDrawNeedles() {
+  const p = scarfGrowP();
+  if (p <= 0) return;
+  const g = scarfState.geo;
+  if (!g) return;
+  const nG = p >= 1 ? g.n : Math.floor(g.n * p);
+  if (nG <= 0) return;
+  const th = currentTheme();
+  const cols = [th.treeLight, th.treeHighlight, th.treeMid];
+  ctx.globalAlpha = 0.9;
+  for (const nd of g.needles) {
+    if (nd.si >= nG) continue;
+    ctx.strokeStyle = cols[nd.c];
+    ctx.lineWidth = nd.w;
+    ctx.beginPath();
+    ctx.moveTo(nd.x, nd.y);
+    ctx.lineTo(nd.x2, nd.y2);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function scarfReleaseLayers() {
+  scarfState.items.clear();
+  scarfState.lastP = -1;
+}
+
+function scarfReset() {
+  scarfState.gen++;
+  for (const it of scarfState.items.values()) {
+    for (const key of ['front', 'back', 'shadow']) {
+      const L = it[key];
+      L.ctx.setTransform(1, 0, 0, 1, 0, 0);
+      L.ctx.clearRect(0, 0, L.cv.width, L.cv.height);
+      L.ctx.setTransform(L.k, 0, 0, L.k, 0, 0);
+    }
+    it.fF = 0; it.bB = 0; it.sS = 0; it.lc = 0;
+    it.tail.ctx.setTransform(1, 0, 0, 1, 0, 0);
+    it.tail.ctx.clearRect(0, 0, it.tail.cv.width, it.tail.cv.height);
+    it.tail.ctx.setTransform(it.tail.k, 0, 0, it.tail.k, 0, 0);
+  }
+  scarfState.lastP = -1;
+}
+
+function scarfInit() {
+  scarfBuildGeo();
+  let end = 0;
+  for (const s of strokes) end = Math.max(end, s.start + s.dur);
+  scarfState.startT = end + 0.1;
+  scarfSelfCheck();
+}
+
+function scarfSelfCheck() {
+  const g = scarfState.geo;
+  if (!g) return;
+  let maxOut = -999, thin = 1e9, worst = null;
+  for (const s of g.front) {
+    for (const p of [s.t0, s.b0, s.t1, s.b1]) {
+      const e = envAt(p.y);
+      const out = Math.abs(p.x - e.cx) - (e.half * 0.99 + 2.2);
+      if (out > maxOut) { maxOut = out; worst = { x: p.x, y: p.y }; }
+    }
+    const wq = Math.hypot(s.b0.x - s.t0.x, s.b0.y - s.t0.y);
+    thin = Math.min(thin, wq);
+  }
+  console.log('[scarf] turns=' + SC.scarfTurns + ' front=' + g.front.length + ' back=' + g.back.length +
+    ' atlasPx=' + g.atlasPx + ' maxOut=' + maxOut.toFixed(2) + ' minBand=' + thin.toFixed(1) +
+    ' start=' + scarfState.startT.toFixed(2) + 's');
+  if (maxOut > 1) console.warn('[scarf] envelope overflow', worst);
 }
 
 
@@ -3800,8 +3123,13 @@ function frame(ts) {
   lastTs = ts;
   if (document.hidden) dt = 0;          // 后台暂停，回到前台不追帧
 
-  if (!reduce) vt += dt;
-  else vt = CONFIG.totalDuration;
+  if (freezeT !== null) {
+    vt = freezeT;
+  } else if (!reduce) {
+    vt += dt;
+  } else {
+    vt = CONFIG.totalDuration;
+  }
 
   if (vt >= CONFIG.totalDuration && !doneOnce) {
     doneOnce = true;
@@ -3839,11 +3167,13 @@ function frame(ts) {
 
   drawBackground(themeNow);
   drawSnow(themeNow, true);
-  drawRibbonBack(themeNow);
+  scarfBlit('back');
   drawTreeLayer();
   drawMoundFront(themeNow);
-  // 围巾暂时撤下，其余部分照常
-  // drawScarfV2(themeNow);
+  scarfBlit('shadow');
+  scarfBlit('front');
+  scarfDrawNeedles();
+  scarfDrawDynamic();
   drawOrnaments(themeNow);
   drawLights(themeNow);
   drawTopStar(themeNow);
@@ -3851,9 +3181,39 @@ function frame(ts) {
   drawGrain(themeNow);
   drawSignature(themeNow);
   if (CONFIG.debugLayout) drawDebugOverlay(themeNow);
+  if (qs.get('bench') === '1' && !window.__benchDone && vt > 10) {
+    window.__benchDone = true;
+    const it = scarfState.items.get(themeState.cur);
+    if (it) {
+      const N = 300, t0 = performance.now();
+      for (let i = 0; i < N; i++) {
+        ctx.drawImage(it.back.cv, 0, 0, W, H);
+        ctx.drawImage(it.shadow.cv, 0, 0, W, H);
+        ctx.drawImage(it.front.cv, 0, 0, W, H);
+      }
+      const blit = (performance.now() - t0) / N;
+      const tailT0 = performance.now();
+      for (let i = 0; i < 200; i++) scarfDrawTail(it, 1);
+      const tailMs = (performance.now() - tailT0) / 200;
+      document.title = 'BENCH bake=' + scarfState.bakeMs.toFixed(1) + 'ms blit3=' + blit.toFixed(3) +
+        'ms tail=' + tailMs.toFixed(3) + 'ms atlas=' + it.atlases.map(a => a.width + 'x' + a.height).join(',');
+    }
+  }
+  if (qs.get('atlas') === '1') {
+    const it = scarfState.items.get(themeState.cur);
+    const atl = it && it.atlases[0];
+    if (atl) {
+      ctx.save();
+      ctx.drawImage(atl, 0, 0, 220, atl.height, 20, 20, 880, 880 * atl.height / 220);
+      ctx.fillStyle = '#fff';
+      ctx.font = '16px monospace';
+      ctx.fillText('atl ' + atl.width + 'x' + atl.height + '  rings ' + it.atlases.map(a => a.width + 'x' + a.height).join(' / ') + '  k ' + it.front.k.toFixed(3), 20, 240);
+      ctx.restore();
+    }
+  }
 
   if (vt >= CONFIG.totalDuration) {
-    autoTick();
+    if (freezeT === null) autoTick();
     if (!trans) pumpCaches(5);
   }
 
@@ -3940,6 +3300,7 @@ replayBtn.addEventListener('pointerdown', (ev) => {
   doneOnce = false;
   nextSwitchAt = null;
   latterReset();
+  scarfReset();
   showToast('已重新作画');
 });
 
@@ -4012,9 +3373,7 @@ function relayoutAll() {
   doneOnce = true;
   kickCaches();
   prepareText();
-  scarfFulls.clear();
-  scarfItems.clear();
-  scarfGeo = null;
+  scarfReleaseLayers();
   updateThemeUI();
 }
 function scheduleRelayout(delay) {
@@ -4037,23 +3396,35 @@ document.addEventListener('visibilitychange', () => {
    13. 启动
    ============================================================ */
 const qs = new URLSearchParams(location.search);
-if (qs.has('t')) themeState.cur = clamp(parseInt(qs.get('t'), 10) || 0, 0, THEMES.length - 1);
+const DBG = {
+  w: parseFloat(qs.get('w')) || 0,
+  h: parseFloat(qs.get('h')) || 0,
+  dpr: parseFloat(qs.get('dpr')) || 0,
+  t: qs.has('t') ? parseFloat(qs.get('t')) : null
+};
+let freezeT = (DBG.t !== null && isFinite(DBG.t)) ? clamp(DBG.t, 0, CONFIG.totalDuration) : null;
+if (qs.has('theme')) themeState.cur = clamp(parseInt(qs.get('theme'), 10) || 0, 0, THEMES.length - 1);
 if (qs.get('auto') === '0') themeState.auto = false;
 if (qs.get('debug') === '1') CONFIG.debugLayout = true;
+if (qs.get('debugScarf') === '1') CONFIG.scarf.debugScarf = true;
+if (DBG.w || DBG.h) {
+  document.body.classList.add('dbg-box');
+  if (DBG.w) document.body.style.width = Math.round(DBG.w) + 'px';
+  if (DBG.h) document.body.style.height = Math.round(DBG.h) + 'px';
+}
 detectPerf();
 validateThemes();
 layout();
+if (qs.get('dump') === '1') setTimeout(() => { document.title = 'MC ' + JSON.stringify(window.__mc) + ' tt=' + document.title; }, 1200);
 buildAll();
 buildDynamic();
-ribbonSelfCheck();
+scarfInit();
 prepareText();
 buildGrain();
 updateThemeUI();
-if (reduce) {
-  vt = CONFIG.totalDuration;
-  fillScene();
-  doneOnce = true;
-  kickCaches();
+if (reduce || freezeT !== null) {
+  if (freezeT !== null) vt = freezeT; else vt = CONFIG.totalDuration;
+  if (vt >= CONFIG.totalDuration) { fillScene(); doneOnce = true; kickCaches(); }
 }
 if (qs.has('vt')) {          // 调试：直接跳到某个时间点的完成态
   vt = clamp(parseFloat(qs.get('vt')) || CONFIG.totalDuration, 0, CONFIG.totalDuration);
