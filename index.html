@@ -3288,7 +3288,7 @@ const scarfItems = new Map();
 function buildScarfGeo() {
   const Ht = G.Ht;
   scarfGeo = { rings: [], topY: G.top, stepDeg: SC.sliceDeg };
-  const A0 = -88, A1 = 88, SPAN = 176;
+  const A0 = -80, A1 = 80, SPAN = 160;
   scarfGeo.A0 = A0; scarfGeo.A1 = A1; scarfGeo.SPAN = SPAN;
 
   const yTopRing = G.top + Ht * 0.18;
@@ -3315,13 +3315,29 @@ function buildScarfGeo() {
   }
 }
 
+function scarfEnv(y) {
+  let half = 1e9;
+  for (let i = 0; i < G.layers.length; i++) {
+    const L = G.layers[i];
+    if (y <= L.yBottom && y >= L.yTop) {
+      const u = clamp((y - L.yTop) / L.h, 0, 1);       // 0 顶 → 1 底
+      half = Math.min(half, L.hw * (0.22 + 0.78 * u));
+    }
+  }
+  if (half === 1e9) {
+    const f = clamp((y - G.top) / G.Ht, 0, 1);
+    half = envHalf(f) * 0.62;
+  }
+  return { cx: G.cx, half: Math.max(8, half * 0.97) };
+}
+
 function scarfPoint(ring, angDeg) {
   const th = angDeg * Math.PI / 180;
   const u = (angDeg - scarfGeo.A0) / scarfGeo.SPAN;
   const yBase = ring.yc + ring.climb * (u - 0.5);
   const env = envAt(yBase);
   // 两端向树身内收，让端头藏进枝叶，而不是飘在轮廓外
-  const radial = 1 - 0.10 * ribbonSmooth(55, 86, Math.abs(angDeg));
+  const radial = 1 - 0.06 * ribbonSmooth(50, 80, Math.abs(angDeg));
   const R = Math.max(10, env.half * ring.fit * radial - 1.5);
   let x = env.cx + R * Math.sin(th);
   const lim = env.half * 0.99;
@@ -3418,8 +3434,8 @@ function buildScarfAtlas(theme) {
     if (!back) {
       for (const sc of [-35, 30]) {
         const xc = ((sc - scarfGeo.A0) / scarfGeo.SPAN) * cols;
-        const segs = [[5, col.stripe], [2.5, null], [2, col.stripe2], [2.5, null], [5, col.stripe]];
-        let off = -7.5;
+        const segs = [[7, col.stripe], [2.5, null], [3, col.stripe2], [2.5, null], [7, col.stripe]];
+        let off = -11;
         for (const [pw, cc] of segs) {
           if (cc) {
             c.globalAlpha = 0.92;
@@ -3562,7 +3578,7 @@ function drawScarfSlices(item, k, upto, alphaMul) {
     const hgt = ((a.w + b.w) * 0.5) + 16;
     let alpha = 1;
     const edge = Math.max(Math.abs(a.a), Math.abs(b.a));
-    if (edge > 84) alpha = ribbonSmooth(88, 83, edge);
+    if (edge > 70) alpha = ribbonSmooth(80, 70, edge);
     if (alpha <= 0.01) continue;
 
     const sx = ((a.a - scarfGeo.A0) / scarfGeo.SPAN) * cols;
@@ -3598,7 +3614,7 @@ function drawScarfTail(item) {
   // 接点：第 0 圈 θ=+72°
   const idx = Math.round((72 - scarfGeo.A0) / SC.sliceDeg);
   const a = ring.pts[Math.min(idx, ring.pts.length - 1)];
-  const env = envAt(a.y);
+  const env = scarfEnv(a.y);
   const w0 = a.w * 0.85;
   const x0 = Math.min(a.x, env.cx + env.half - w0 * 0.5 - 3);
   const y0 = a.y + a.w * 0.5 - 2;
@@ -3826,7 +3842,8 @@ function frame(ts) {
   drawRibbonBack(themeNow);
   drawTreeLayer();
   drawMoundFront(themeNow);
-  drawScarfV2(themeNow);
+  // 围巾暂时撤下，其余部分照常
+  // drawScarfV2(themeNow);
   drawOrnaments(themeNow);
   drawLights(themeNow);
   drawTopStar(themeNow);
@@ -3998,8 +4015,6 @@ function relayoutAll() {
   scarfFulls.clear();
   scarfItems.clear();
   scarfGeo = null;
-  buildScarfGeo();
-  createScarfItem(themeState.cur);
   updateThemeUI();
 }
 function scheduleRelayout(delay) {
@@ -4033,8 +4048,6 @@ buildDynamic();
 ribbonSelfCheck();
 prepareText();
 buildGrain();
-buildScarfGeo();
-createScarfItem(themeState.cur);
 updateThemeUI();
 if (reduce) {
   vt = CONFIG.totalDuration;
@@ -4054,6 +4067,10 @@ requestAnimationFrame(frame);
 </script>
 </body>
 </html>
+
+
+
+
 
 
 
